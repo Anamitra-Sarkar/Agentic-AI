@@ -1,28 +1,35 @@
 export const TaskRouter = {
-    // GROQ (Verified Routing Matrix)
-    rectification: { provider: 'groq', model: 'llama-3.3-70b-versatile' } as const,
-    clarifier: { provider: 'groq', model: 'llama-3.3-70b-versatile' } as const,
-    compression: { provider: 'groq', model: 'llama-3.3-70b-versatile' } as const,
-    toolController: { provider: 'groq', model: 'llama-3.3-70b-versatile' } as const,
-    
-    // THE SWARM PHASES
-    draft: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } as const,
-    audit: { provider: 'groq', model: 'openai/gpt-oss-120b' } as const,
-    rapidPatch: { provider: 'groq', model: 'qwen/qwen3-32b' } as const,
-    
-    // NVIDIA NIM (Infrastructure)
-    backendCore: { provider: 'nvidia', model: 'qwen3-coder-480b-a35b-instruct', fallback: { provider: 'groq', model: 'qwen/qwen3-32b' } } as const,
-    agenticLogic: { provider: 'nvidia', model: 'deepseek-v3.2' } as const, 
-    intermediateLogic: { provider: 'nvidia', model: 'llama-4-maverick-17b-128e-instruct', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } } as const,
-    asyncOrchestration: { provider: 'nvidia', model: 'step-3.5-flash' } as const,
+  // GROQ — Ultra-fast inference (<1s)
+  clarifier:          { provider: 'groq', model: 'llama-3.3-70b-versatile' },
+  rectification:      { provider: 'groq', model: 'llama-3.3-70b-versatile' },
+  compression:        { provider: 'groq', model: 'llama-3.3-70b-versatile' },
+  toolController:     { provider: 'groq', model: 'llama-3.3-70b-versatile' },
+  validation:         { provider: 'groq', model: 'openai/gpt-oss-120b' },
+  audit:              { provider: 'groq', model: 'openai/gpt-oss-120b' },
+  rapidPatch:         { provider: 'groq', model: 'qwen/qwen3-32b' },
+  draft:              { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
 
-    // OPENROUTER (Frontend)
-    refactoring: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' } as const,
-    apiInterfaces: { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'llama-3.3-70b-versatile' } } as const,
-    frontendReact: { provider: 'openrouter', model: 'z-ai/glm-4.5-air:free' } as const,
-    edgeCasesDocs: { provider: 'openrouter', model: 'openai/gpt-oss-120b:free', fallback: { provider: 'groq', model: 'openai/gpt-oss-120b' } } as const,
-    validation: { provider: 'groq', model: 'openai/gpt-oss-120b' } as const, // Heavyweight for validation
-    cloneMode: { provider: 'nvidia', model: 'qwen3-coder-480b-a35b-instruct', fallback: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' } } as const
+  // NVIDIA NIM — Heavy infrastructure & coding specialists
+  backendCore:        { provider: 'nvidia', model: 'qwen/qwen3-coder-480b-a35b-instruct', fallback: { provider: 'groq', model: 'qwen/qwen3-32b' } },
+  agenticLogic:       { provider: 'nvidia', model: 'deepseek/deepseek-v3.2' },
+  asyncOrchestration: { provider: 'nvidia', model: 'writer/palmyra-x5' },
+  cloneMode:          { provider: 'nvidia', model: 'qwen/qwen3-coder-480b-a35b-instruct', fallback: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' } },
+  intermediateLogic:  { provider: 'nvidia', model: 'meta/llama-4-maverick-17b-128e-instruct', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
+  dataModeling:       { provider: 'nvidia', model: 'mistralai/mistral-small-3.1-24b-instruct' },
+  sqlGeneration:      { provider: 'nvidia', model: 'mistralai/mistral-small-3.1-24b-instruct' },
+
+  // OPENROUTER FREE TIER — Specialized models
+  visualAnalysis:     { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
+  uiClone:            { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
+  refactoring:        { provider: 'openrouter', model: 'z-ai/glm-4.5-air:free' },
+  docGeneration:      { provider: 'openrouter', model: 'z-ai/glm-4.5-air:free' },
+  frontendReact:      { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
+  apiInterfaces:      { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'llama-3.3-70b-versatile' } },
+  edgeCasesDocs:      { provider: 'openrouter', model: 'openai/gpt-oss-120b:free', fallback: { provider: 'groq', model: 'openai/gpt-oss-120b' } },
+  architectureDesign: { provider: 'openrouter', model: 'deepseek/deepseek-v3:free', fallback: { provider: 'nvidia', model: 'deepseek/deepseek-v3.2' } },
+  bugAnalysis:        { provider: 'openrouter', model: 'deepseek/deepseek-v3:free', fallback: { provider: 'nvidia', model: 'deepseek/deepseek-v3.2' } },
+  i18nLocalization:   { provider: 'openrouter', model: 'qwen/qwen3-30b-a3b:free' },
+  codeReview:         { provider: 'openrouter', model: 'qwen/qwen3-30b-a3b:free' },
 } as const;
 
 export const groqTools = [

@@ -16,14 +16,14 @@ export const ChatPanel: React.FC<{
   instructionQueue: QueuedInstruction[];
   addToQueue: (s: string) => void;
   chatEndRef: React.RefObject<HTMLDivElement>;
-  pendingPlan: { title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null;
-  setPendingPlan: (p: any) => void;
+  pendingPlan?: { title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null;
+  setPendingPlan?: (p: any) => void;
 }> = ({ chatHistory, followUp, setFollowUp, isGenerating, sendFollowUpDirect, queueInput, setQueueInput, instructionQueue, addToQueue, chatEndRef, pendingPlan, setPendingPlan }) => {
   return (
     <div className="flex-1 bg-white rounded-[12px] border border-alpha shadow-2xl overflow-hidden flex flex-col">
       <div className="p-6 overflow-y-auto custom-scrollbar space-y-4" style={{ maxHeight: '60vh' }}>
         {/* Plan confirmation card (if any) */}
-        {pendingPlan && <PlanConfirmCard pendingPlan={pendingPlan} setPendingPlan={setPendingPlan} />}
+        {pendingPlan && <PlanConfirmCard title={pendingPlan.title} steps={pendingPlan.steps} onApprove={() => { pendingPlan.onApprove(); setPendingPlan(null); }} onReject={() => { pendingPlan.onReject(); setPendingPlan(null); }} /> }
 
         {chatHistory.map((msg, idx) => (
           <motion.div key={idx} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`p-4 rounded-[8px] ${msg.role === 'user' ? 'bg-[#f7f6f2] text-[#2d2d2d]' : msg.role === 'ai' ? 'bg-[#f9f8f5] text-[#2d2d2d]' : msg.role === 'system' ? 'bg-[#efebe3] text-[#6b6b6b]' : 'bg-[#fff3cd] text-[#6b6b6b]'}`}>

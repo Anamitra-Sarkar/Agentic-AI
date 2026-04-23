@@ -59,6 +59,8 @@ export default function App() {
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [isGenerationQueued, setIsGenerationQueued] = useState(false);
   const chatHistoryRef = useRef<ChatMessage[]>([]);
+  // Pending plan confirmation state for grounded edits
+  const [pendingPlan, setPendingPlan] = useState<{ title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null>(null);
   
   const updateProjectFiles = (newFiles: Record<string, string>) => {
     filesSnapshotRef.current = newFiles;
@@ -625,6 +627,52 @@ export default function App() {
               return `// Write Error: Sync failed.`;
           }
       }
+
+      // Grounded edit tools
+      if (name === 'fs_search') {
+          const pattern = args.pattern;
+          const glob = args.file_glob || '';
+          const matches: { file: string; line: number; content: string }[] = [];
+          try {
+            const regex = new RegExp(pattern, 'i');
+            for (const [filePath, content] of Object.entries(filesSnapshotRef.current)) {
+              if (glob && !filePath.includes(glob)) continue;
+              const lines = (content as string).split('\n');
+              lines.forEach((line, idx) => {
+                if (regex.test(line)) {
+                  matches.push({ file: filePath, line: idx + 1, content: line.trim().substring(0, 120) });
+                }
+              });
+            }
+          } catch (e) {
+            return JSON.stringify({ error: 'Invalid regex pattern' });
+          }
+          log(`fs_search: "${pattern}" → ${matches.length} matches across ${[...new Set(matches.map(m => m.file))].length} files`, 'tool');
+          return JSON.stringify({ matches: matches.slice(0, 50) });
+      }
+
+      if (name === 'fs_read_lines') {
+          const content = filesSnapshotRef.current[args.file_path];
+          if (!content) return JSON.stringify({ error: `File not found: ${args.file_path}` });
+          const lines = content.split('\n');
+          const start = Math.max(0, args.start_line - 1);
+          const end = Math.min(lines.length, args.end_line);
+          const result = lines.slice(start, end).map((l, i) => `${start + i + 1}: ${l}`).join('\n');
+          log(`fs_read_lines: ${args.file_path} lines ${args.start_line}-${args.end_line}`, 'tool');
+          return result;
+      }
+
+      if (name === 'plan_and_confirm') {
+          return new Promise<string>((resolve) => {
+            setPendingPlan({
+              title: args.title,
+              steps: args.steps,
+              onApprove: () => { setPendingPlan(null); resolve('APPROVED'); },
+              onReject:  () => { setPendingPlan(null); resolve('REJECTED'); }
+            });
+          });
+      }
+
       if (name === 'apply_unified_diff') {
           const patchText = args.patch_text;
           const patchRegex = /FILE:\s*([^\s\n]+)\n<<<<<<<\s*SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE/g;
@@ -872,11 +920,11 @@ Return ONLY valid JSON in this exact shape:
       setActiveAgents({ 'Drafting': taskConfig.model });
       
       const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
-          callAPI(taskConfig, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
-          callAPI(taskConfig, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
-          callAPI(taskConfig, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
-          callAPI(taskConfig, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
-          callAPI(taskConfig, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
+          callAPI(TaskRouter.backendCore, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(TaskRouter.frontendReact, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(TaskRouter.visualAnalysis, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
+          callAPI(TaskRouter.dataModeling, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
+          callAPI(TaskRouter.intermediateLogic, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
       ]);
 
       const initialFiles = {
@@ -1078,17 +1126,40 @@ Return ONLY valid JSON in this exact shape:
         logger('Intent Prediction: Scanning Backend environment...', 'system');
         await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: 'ls -R backend', workdir: '/' }) } }, logger);
     }
-    
+
+    // Intent Detection — route to specialist model
+    const intentRes = await callAPI(
+      TaskRouter.clarifier,
+      'Classify this modification request into EXACTLY ONE word from: backend | frontend | bugfix | refactor | architecture | styling. Reply with only that one word, nothing else.',
+      userMsg
+    );
+    const intent = intentRes?.content?.trim().toLowerCase().split(/\s/)[0] || 'frontend';
+
+    const taskForIntent: Record<string, any> = {
+      'backend':      TaskRouter.backendCore,
+      'frontend':     TaskRouter.frontendReact,
+      'bugfix':       TaskRouter.bugAnalysis,
+      'refactor':     TaskRouter.refactoring,
+      'architecture': TaskRouter.architectureDesign,
+      'styling':      TaskRouter.visualAnalysis,
+    };
+    const selectedTask = taskForIntent[intent] ?? TaskRouter.draft;
+    logger(`Intent: "${intent}" → Routing to ${selectedTask.model}`, 'system');
+
     // PHASE 1: DRAFT PATCH (Surgical)
     logger('COMMENCING DELTA-FIRST PATCH: Drafting surgical unified diff...', 'system');
-    setActiveAgents({ 'Engineer': TaskRouter.draft.model });
-    
-    const draftPatch = await callAPI(TaskRouter.draft, 
-        `STRICT SURGICAL DELTA PROTOCOL. You are the Senior Engineer.
-        1. You MUST use apply_unified_diff. Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> REPLACE
-        2. Only provide the specific viewport (5-10 lines) affected.
-        3. STRICTLY PURE CODE. NO MARKDOWN HEADERS. No prose.
-        4. Consult SOUL.md. Current SOUL: ${soulContent}`, 
+    setActiveAgents({ 'Engineer': selectedTask.model });
+
+    const draftPatch = await callAPI(selectedTask,
+        `STRICT GROUNDED EDIT PROTOCOL — You are the Senior Engineer.
+MANDATORY SEQUENCE — you MUST follow this order or the edit will be rejected:
+1. Call fs_search to locate the relevant code section
+2. Call fs_read_lines to read the exact lines before touching them
+3. Call plan_and_confirm with your complete numbered edit plan
+4. ONLY after plan is approved: call apply_unified_diff
+You are FORBIDDEN from calling apply_unified_diff without first calling plan_and_confirm.
+Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> REPLACE
+SOUL context: ${soulContent}`,
         `Modification Task: ${userMsg}
         --- 
         CURRENT CODEBASE:
@@ -1656,6 +1727,8 @@ Return ONLY valid JSON in this exact shape:
         instructionQueue={instructionQueue}
         addToQueue={addToQueue}
         chatEndRef={chatEndRef}
+        pendingPlan={pendingPlan}
+        setPendingPlan={setPendingPlan}
       />
 
       {/* Main Workspace */}
@@ -1780,7 +1853,6 @@ Return ONLY valid JSON in this exact shape:
 
                 <TerminalPanel terminalEntries={terminalEntries} setTerminalEntries={setTerminalEntries} commandQueue={commandQueue} setCommandQueue={setCommandQueue} aiExecuteMode={aiExecuteMode} setAiExecuteMode={setAiExecuteMode} executeAllQueued={executeAllQueued} runTerminalCommand={runTerminalCommand} terminalEndRef={terminalEndRef} />
 
-                </div>
             </motion.div>
           )}
 

@@ -1,27 +1,71 @@
+import { CheckCircle2, X } from 'lucide-react';
 import React from 'react';
-import { motion } from 'motion/react';
 
-export const PlanConfirmCard: React.FC<{
-  pendingPlan: { title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null;
-  setPendingPlan: (p: any) => void;
-}> = ({ pendingPlan, setPendingPlan }) => {
-  if (!pendingPlan) return null;
+interface PlanConfirmCardProps {
+  title: string;
+  steps: string[];
+  onApprove: () => void;
+  onReject: () => void;
+}
+
+export function PlanConfirmCard({ title, steps, onApprove, onReject }: PlanConfirmCardProps) {
   return (
-    <motion.div initial={{ y: -20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: -20, opacity: 0 }} className="bg-[#fff8f0] border border-[#f3e8de] rounded-[10px] p-4 mb-4 shadow-sm">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="font-bold text-sm text-[#2d2d2d] mb-2">{pendingPlan.title}</div>
-          <ol className="text-[13px] text-[#4b4b4b] list-decimal list-inside space-y-1">
-            {pendingPlan.steps.map((s, i) => (
-              <li key={i} className="leading-snug">{s}</li>
-            ))}
-          </ol>
-        </div>
-        <div className="flex flex-col gap-2">
-          <button onClick={() => { pendingPlan.onApprove(); setPendingPlan(null); }} className="px-4 py-2 rounded bg-[#01696f] text-white font-bold">Approve & Execute</button>
-          <button onClick={() => { pendingPlan.onReject(); setPendingPlan(null); }} className="px-4 py-2 rounded bg-transparent border border-alpha font-bold">Cancel</button>
-        </div>
+    <div
+      style={{
+        background: '#f9f8f5',
+        border: '1px solid oklch(0.4 0.01 80 / 0.15)',
+        borderRadius: '12px',
+        padding: '16px 20px',
+        marginBottom: '12px',
+        boxShadow: '0 4px 12px oklch(0.2 0.01 80 / 0.08)',
+        animation: 'slideDown 180ms cubic-bezier(0.16, 1, 0.3, 1)'
+      }}
+    >
+      <style>{`@keyframes slideDown { from { opacity:0; transform:translateY(-8px); } to { opacity:1; transform:translateY(0); } }`}</style>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+        <CheckCircle2 size={16} color="#01696f" />
+        <span style={{ fontWeight: 600, fontSize: '14px', color: '#1a1a1a' }}>{title}</span>
       </div>
-    </motion.div>
+      <ol style={{ margin: '0 0 16px 0', paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+        {steps.map((step, i) => (
+          <li key={i} style={{ fontSize: '13px', color: '#4a4a4a', lineHeight: 1.5 }}>{step}</li>
+        ))}
+      </ol>
+      <div style={{ display: 'flex', gap: '8px' }}>
+        <button
+          onClick={onApprove}
+          style={{
+            padding: '7px 16px',
+            borderRadius: '8px',
+            background: '#01696f',
+            color: '#fff',
+            border: 'none',
+            fontSize: '13px',
+            fontWeight: 600,
+            cursor: 'pointer',
+            transition: 'background 180ms ease'
+          }}
+          onMouseEnter={e => (e.currentTarget.style.background = '#0c4e54')}
+          onMouseLeave={e => (e.currentTarget.style.background = '#01696f')}
+        >
+          Approve & Execute
+        </button>
+        <button
+          onClick={onReject}
+          style={{
+            padding: '7px 16px',
+            borderRadius: '8px',
+            background: 'transparent',
+            color: '#555',
+            border: '1px solid oklch(0.4 0.01 80 / 0.2)',
+            fontSize: '13px',
+            cursor: 'pointer'
+          }}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
-};
+}
+

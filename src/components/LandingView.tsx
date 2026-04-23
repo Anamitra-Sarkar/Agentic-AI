@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'motion/react';
-import { Layers, Sparkles as SparklesIcon, Globe, RefreshCcw, Bot, Check } from 'lucide-react';
+import { Layers, Sparkles as SparklesIcon, Globe, RefreshCcw, Bot, Check, Camera } from 'lucide-react';
 import type { ClarificationQuestion, Session } from '../types';
 
 export const LandingView: React.FC<{
@@ -29,7 +29,51 @@ export const LandingView: React.FC<{
   authLoading: boolean;
   rectifiedPrompt: string;
   handleApproveAndBuild: () => void;
-}> = ({ prompt, setPrompt, cloneUrl, setCloneUrl, isUrlMode, setIsUrlMode, clarifications, setClarifications, status, isClarifying, isAnalyzing, cloneProgress, handleCloneFromUrl, askClarifications, submitClarifications, sessions, loadSession, createSession, user, signInWithGoogle, signInWithGithub, logout, authLoading, rectifiedPrompt, handleApproveAndBuild }) => {
+  onScreenshotBuild: (prompt: string) => void;
+}> = ({ prompt, setPrompt, cloneUrl, setCloneUrl, isUrlMode, setIsUrlMode, clarifications, setClarifications, status, isClarifying, isAnalyzing, cloneProgress, handleCloneFromUrl, askClarifications, submitClarifications, sessions, loadSession, createSession, user, signInWithGoogle, signInWithGithub, logout, authLoading, rectifiedPrompt, handleApproveAndBuild, onScreenshotBuild }) => {
+  const screenshotInputRef = React.useRef<HTMLInputElement>(null);
+  const [screenshotPreview, setScreenshotPreview] = React.useState<string|null>(null);
+  const [isAnalyzingScreenshot, setIsAnalyzingScreenshot] = React.useState(false);
+
+  const handleScreenshotUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const base64 = (ev.target?.result as string).split(',')[1];
+      const previewUrl = ev.target?.result as string;
+      setScreenshotPreview(previewUrl);
+      setIsAnalyzingScreenshot(true);
+      try {
+        const res = await fetch('/api/proxy/openrouter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'google/gemma-4-31b-it:free',
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+                { type: 'text', text: 'Analyze this UI screenshot in exhaustive technical detail. Describe: exact layout structure, color palette (provide hex codes), typography (font sizes, weights), spacing, every component visible, interactions, and animations. Then output a complete React 19 + Tailwind CSS implementation specification that would recreate this UI pixel-accurately.' }
+              ]
+            }],
+            max_tokens: 2000
+          })
+        });
+        const data = await res.json();
+        const analysisPrompt = data.choices?.[0]?.message?.content || '';
+        const fullPrompt = `SCREENSHOT-TO-CODE TARGET:\n${analysisPrompt}`;
+        onScreenshotBuild(fullPrompt);
+      } catch (err) {
+        console.error('Screenshot analysis failed', err);
+      } finally {
+        setIsAnalyzingScreenshot(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+
   return (
     <div className="min-h-screen bg-[#f7f6f2] text-[#2d2d2d] flex flex-col md:flex-row font-sans">
       {/* Session Sidebar */}
