@@ -195,6 +195,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('workspace');
   const [projectFiles, setProjectFiles] = useState<Record<string, string>>({});
   const filesSnapshotRef = useRef<Record<string, string>>({});
+  const fileIdMapRef = useRef<Record<string, string>>({});
   const [resumeCheckpoint, setResumeCheckpoint] = useState<CheckpointState | null>(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [isGenerationQueued, setIsGenerationQueued] = useState(false);
@@ -484,6 +485,10 @@ export default function App() {
       const fileMap: Record<string, string> = {};
       filesArr.forEach((f: any) => { fileMap[f.path] = f.content; });
       
+      // Populate filename -> id cache for faster auto-save
+      fileIdMapRef.current = {};
+      filesArr.forEach((f: any) => { if (f.path && f.id) fileIdMapRef.current[f.path] = f.id; });
+
       updateProjectFiles(fileMap);
       setTerminalEntries(history.map((h: any) => ({
         id: Math.random().toString(36).substring(7),
@@ -521,23 +526,25 @@ export default function App() {
     if (!activeSession) return;
     setIsAutoSaving(true);
     try {
-      // Find file ID if exists
-      const filesRes = await fetchWithRetry(`/api/sessions/${activeSession.id}/files`, { method: 'GET', headers: sessionHeaders() });
-      const filesArr = await filesRes.json();
-      const existing = filesArr.find((f: any) => f.path === filename);
-      
-      if (existing) {
-        await fetchWithRetry(`/api/sessions/${activeSession.id}/files/${existing.id}`, {
+      // Use cached filename -> id map to avoid fetching the file list repeatedly
+      const existingId = fileIdMapRef.current[filename];
+      if (existingId) {
+        await fetchWithRetry(`/api/sessions/${activeSession.id}/files/${existingId}`, {
           method: 'PUT',
           headers: sessionHeaders(),
           body: JSON.stringify({ content })
         });
       } else {
-        await fetchWithRetry(`/api/sessions/${activeSession.id}/files`, {
+        const res = await fetchWithRetry(`/api/sessions/${activeSession.id}/files`, {
           method: 'POST',
           headers: sessionHeaders(),
           body: JSON.stringify({ path: filename, content, language: 'typescript' })
         });
+        // Update cache with returned id if available
+        const created = await res.json().catch(() => null);
+        if (created && created.id && created.path) {
+          fileIdMapRef.current[created.path] = created.id;
+        }
       }
     } catch (e) {
       console.error('Auto-save failed', e);
@@ -546,7 +553,7 @@ export default function App() {
     }
   };
 
-  const [autoSaveTimer, setAutoSaveTimer] = useState<NodeJS.Timeout|null>(null);
+  const autoSaveTimerRef = useRef<NodeJS.Timeout|null>(null);
 
   const handleFileChange = (filename: string, content: string) => {
       const newFiles = { ...filesSnapshotRef.current, [filename]: content };
@@ -558,11 +565,11 @@ export default function App() {
       }, 500);
 
       // Auto-save logic (2s debounce)
-      if (autoSaveTimer) clearTimeout(autoSaveTimer);
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current as any);
       const timer = setTimeout(() => {
           autoSaveFile(filename, content);
       }, 2000);
-      setAutoSaveTimer(timer);
+      autoSaveTimerRef.current = timer as any;
   };
 
   const runTerminalCommand = async (command: string, workdir: string = '/', source: 'ai' | 'user' = 'user') => {
@@ -976,7 +983,7 @@ Return ONLY valid JSON in this exact shape:
     const additionalInstruction = isClone ? "\nThis is a pixel-accurate clone task. Match the visual design, colors, layout structure, and content hierarchy as closely as possible. Do NOT add generic placeholder content." : "";
 
     // PHASE 1: PLAN (Manifest Generation & SOUL.md Integration)
-    const projectSoul = `# SOUL.md - Project Integrity State\n\n## Tech Stack\n- Backend: ${isClone ? 'Python 3.10 (FastAPI)' : 'Python 3.10 (FastAPI)'}\n- Frontend: React 19 + Tailwind CSS\n- UI Style: ${isClone ? 'Identical Clone' : 'Frosted Neon'}\n\n## Design System (The Vibe)\n- Spec: ${rectifiedPrompt.substring(0, 500)}\n\n## Verification Status\n- Build Status: Awaiting Pulse Check\n`;
+    const projectSoul = `# SOUL.md - Project Integrity State\n\n## Tech Stack\n- Backend: ${isClone ? 'Python 3.10 (FastAPI)' : 'Python 3.10 (FastAPI)'}\n- Frontend: React 19 + Tailwind CSS\n- UI Style: ${isClone ? 'Identical Clone' : 'Light & Soothing — warm beige surfaces (#f7f6f2 bg, #f9f8f5 cards), teal accent (#01696f), Satoshi body font, Boska display font'}\n\n## Design System (The Vibe)\n- Spec: ${rectifiedPrompt.substring(0, 500)}\n\n## Verification Status\n- Build Status: Awaiting Pulse Check\n`;
     let currentFiles: Record<string, string> = startPhase > 1 ? { ...restoredFiles } : { 'SOUL.md': projectSoul };
 
     if (startPhase <= 1) {
@@ -1056,13 +1063,22 @@ Return ONLY valid JSON in this exact shape:
     const agenticTerminalRun = async (primary: string, fallbacks: string[], workdir: string = '/') => {
         logger(`Running: ${primary}...`, 'system');
         let resRaw = await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: primary, workdir }) } }, logger);
-        let status = JSON.parse(resRaw);
+        let status: any;
+        try {
+            status = JSON.parse(resRaw);
+        } catch (e) {
+            status = { exit_code: -1, stderr: String(resRaw) };
+        }
         
         if (status.exit_code !== 0) {
             for (const fallback of fallbacks) {
                 logger(`Primary failed. Trying fallback: ${fallback}...`, 'warning');
                 resRaw = await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: fallback, workdir }) } }, logger);
-                status = JSON.parse(resRaw);
+                try {
+                    status = JSON.parse(resRaw);
+                } catch (e) {
+                    status = { exit_code: -1, stderr: String(resRaw) };
+                }
                 if (status.exit_code === 0) break;
             }
         }
