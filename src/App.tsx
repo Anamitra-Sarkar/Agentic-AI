@@ -15,158 +15,13 @@ import {
 } from 'lucide-react';
 import { auth, signInWithGoogle, signInWithGithub, logout, onAuthStateChanged, type User as FirebaseUser } from './firebase';
 
-type View = 'landing' | 'building';
-type AppStatus = 'idle' | 'clarifying' | 'rectifying' | 'prompt-review' | 'building';
-type Tab = 'workspace' | 'codebase' | 'preview';
+import type { View, AppStatus, Tab, ClarificationQuestion, QueuedInstruction, Session, TerminalEntry, CommandQueueItem, ToastType, ToastItem, ChatMessage, CheckpointState, TaskConfig } from './types';
+import { TaskRouter, groqTools } from './constants';
+import { cleanCode, waitForOnline, fetchWithRetry } from './utils';
+import { ToastContainer } from './components/ToastContainer';
+import { ConfirmModal } from './components/ConfirmModal';
 
-type ClarificationQuestion = {
-  id: string;
-  question: string;
-  type: 'yesno' | 'choice' | 'text';
-  options?: string[];
-  answer: string | null;
-};
 
-type QueuedInstruction = {
-  id: string;
-  instruction: string;
-  queuedAt: number;
-  status: 'queued' | 'processing' | 'done' | 'failed';
-};
-
-interface Session {
-  id: string;
-  name: string;
-  created_at: number;
-  last_modified: number;
-  model_config: any;
-}
-
-interface TerminalEntry {
-  id: string;
-  source: 'ai' | 'user';
-  command: string;
-  output: string;
-  status: 'pending' | 'running' | 'success' | 'error';
-  timestamp: number;
-}
-
-interface CommandQueueItem {
-  id: string;
-  command: string;
-  workdir: string;
-}
-
-type ToastType = 'success' | 'error' | 'warning' | 'info';
-interface ToastItem {
-  id: string;
-  message: string;
-  type: ToastType;
-}
-
-interface ChatMessage {
-  role: 'user' | 'ai' | 'system' | 'warning' | 'tool';
-  content: string;
-}
-
-interface CheckpointState {
-  phase: string;
-  files: Record<string, string>;
-  chatHistory: ChatMessage[];
-  updated_at: number;
-}
-
-const cleanCode = (text: string) => {
-    // 1. Aggressively extract the first code block if it exists (standard Markdown)
-    const codeBlockMatch = text.match(/```(?:[\w\-]*)\n([\s\S]*?)```/);
-    if (codeBlockMatch) return codeBlockMatch[1].trim();
-
-    // 2. Fallback: Check for blocks that might start with triple backticks but no newline immediately
-    const strictMatch = text.match(/```([\s\S]*?)```/);
-    if (strictMatch) return strictMatch[1].trim();
-    
-    // 3. Fallback: If no backticks, check if the LLM outputted a raw JSON structure
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-        try {
-            // Test if it's perfectly valid JSON
-            JSON.parse(jsonMatch[0]);
-            return jsonMatch[0].trim();
-        } catch (e) {
-            // Not perfect JSON, but maybe close enough if it's the primary structure
-        }
-    }
-
-    // 4. Fallback: Remove common leading/trailing prose indicators
-    let cleaned = text.trim();
-    cleaned = cleaned.replace(/^(Here is the code[:\s]*|Below is the (?:executable|complete) code[:\s]*|File Content[:\s]*)/i, '');
-    
-    return cleaned.trim();
-};
-
-const TaskRouter = {
-    // GROQ (Verified Routing Matrix)
-    rectification: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
-    clarifier: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
-    compression: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
-    toolController: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
-    
-    // THE SWARM PHASES
-    draft: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
-    audit: { provider: 'groq', model: 'openai/gpt-oss-120b' },
-    rapidPatch: { provider: 'groq', model: 'qwen/qwen3-32b' },
-    
-    // NVIDIA NIM (Infrastructure)
-    backendCore: { provider: 'nvidia', model: 'qwen3-coder-480b-a35b-instruct', fallback: { provider: 'groq', model: 'qwen/qwen3-32b' } },
-    agenticLogic: { provider: 'nvidia', model: 'deepseek-v3.2' }, 
-    intermediateLogic: { provider: 'nvidia', model: 'llama-4-maverick-17b-128e-instruct', fallback: { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
-    asyncOrchestration: { provider: 'nvidia', model: 'step-3.5-flash' },
-
-    // OPENROUTER (Frontend)
-    refactoring: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' },
-    apiInterfaces: { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'llama-3.3-70b-versatile' } },
-    frontendReact: { provider: 'openrouter', model: 'z-ai/glm-4.5-air:free' },
-    edgeCasesDocs: { provider: 'openrouter', model: 'openai/gpt-oss-120b:free', fallback: { provider: 'groq', model: 'openai/gpt-oss-120b' } },
-    validation: { provider: 'groq', model: 'openai/gpt-oss-120b' }, // Heavyweight for validation
-    cloneMode: { provider: 'nvidia', model: 'qwen3-coder-480b-a35b-instruct', fallback: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' } }
-} as const;
-
-type TaskConfig = typeof TaskRouter[keyof typeof TaskRouter];
-
-const groqTools = [
-    { type: "function", function: { name: "tavily_dependency_check", description: "Query package stats (e.g. react 19, tailwind 4, etc).", parameters: { type: "object", properties: { package_name: { type: "string" }, framework: { type: "string" } }, required: ["package_name", "framework"] } } },
-    { type: "function", function: { name: "huggingface_space_init", description: "Generate README.md for Docker HuggingFace spaces using port 7860.", parameters: { type: "object", properties: { space_name: { type: "string" }, sdk: { type: "string", enum: ["docker", "gradio"] } }, required: ["space_name", "sdk"] } } },
-    { type: "function", function: { name: "vercel_json_scaffold", description: "Generate vercel.json rewrite rules.", parameters: { type: "object", properties: { framework_preset: { type: "string" } }, required: ["framework_preset"] } } },
-    { type: "function", function: { name: "terminal_run", description: "Executes a shell command on the Hugging Face Docker backend and returns the full log.", parameters: { type: "object", properties: { command: { type: "string" }, workdir: { type: "string" } }, required: ["command", "workdir"] } } },
-    { type: "function", function: { name: "fs_sync", description: "Bulk-writes the entire project state to the Hugging Face Docker volume.", parameters: { type: "object", properties: { files: { type: "object", additionalProperties: { type: "string" } } }, required: ["files"] } } },
-    { type: "function", function: { name: "apply_unified_diff", description: "Surgically update a file using SEARCH/REPLACE blocks. Forbidden from sending whole files.", parameters: { type: "object", properties: { patch_text: { type: "string", description: "Raw SEARCH/REPLACE blocks. Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> REPLACE" } }, required: ["patch_text"] } } },
-    { type: "function", function: { name: "get_preview_url", description: "Returns the proxied URL for the running app on the HF container.", parameters: { type: "object", properties: {}, required: [] } } }
-];
-
-const waitForOnline = () => new Promise<void>((resolve) => {
-  if (navigator.onLine) return resolve();
-  const handleOnline = () => {
-    window.removeEventListener('online', handleOnline);
-    resolve();
-  };
-  window.addEventListener('online', handleOnline);
-});
-
-const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 4): Promise<Response> => {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      if (!navigator.onLine) await waitForOnline();
-      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(60000) });
-      if (res.status === 503 || res.status === 429) throw new Error(`HTTP${res.status}`);
-      return res;
-    } catch (err: any) {
-      if (attempt === maxRetries) throw err;
-      const delay = Math.min(1000 * 2 ** attempt, 16000);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  throw new Error('Max retries exceeded');
-};
 
 export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
@@ -2399,63 +2254,12 @@ Return ONLY valid JSON in this exact shape:
         {/* Portals */}
         {createPortal(
           <>
-            {/* Toast System */}
-            <div className="fixed top-8 right-8 z-[100] flex flex-col gap-2 pointer-events-none">
-              <AnimatePresence mode="popLayout">
-                {toasts.map((t) => (
-                  <motion.div
-                    key={t.id}
-                    initial={{ x: 100, opacity: 0 }}
-                    animate={{ x: 0, opacity: 1 }}
-                    exit={{ x: 100, opacity: 0 }}
-                    className="pointer-events-auto bg-[#f9f8f5] shadow-warm border border-alpha rounded-full px-5 py-3 flex items-center gap-3 group relative overflow-hidden"
-                  >
-                    <div className={`w-2 h-2 rounded-full ${t.type === 'success' ? 'bg-[#01696f]' : t.type === 'error' ? 'bg-rose-500' : t.type === 'warning' ? 'bg-amber-500' : 'bg-[#6b6b6b]'}`} />
-                    <span className="text-sm font-bold text-[#2d2d2d] pr-4">{t.message}</span>
-                    <button onClick={() => removeToast(t.id)} className="p-1 hover:bg-[#efebe3] rounded-full transition-colors opacity-0 group-hover:opacity-100">
-                      <X className="w-3 h-3 text-[#6b6b6b]" />
-                    </button>
-                    <motion.div 
-                      initial={{ width: '100%' }} 
-                      animate={{ width: 0 }} 
-                      transition={{ duration: 3, ease: 'linear' }}
-                      onAnimationComplete={() => removeToast(t.id)}
-                      className="absolute bottom-0 left-0 h-0.5 bg-[#01696f]/20"
-                    />
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </div>
+            {/* Portals: Toasts & Modal */}
+        <>
+          <ToastContainer toasts={toasts} removeToast={removeToast} />
+          <ConfirmModal modal={modal} setModal={setModal} />
+        </>
 
-            {/* Confirmation Modal */}
-            {modal?.isOpen && (
-              <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
-                <motion.div 
-                  initial={{ opacity: 0 }} 
-                  animate={{ opacity: 1 }} 
-                  className="absolute inset-0 bg-[#2d2d2d]/20 backdrop-blur-[4px]" 
-                  onClick={() => setModal(null)}
-                />
-                <motion.div 
-                  initial={{ scale: 0.95, opacity: 0 }} 
-                  animate={{ scale: 1, opacity: 1 }}
-                  transition={{ duration: 0.18 }}
-                  className="bg-[#f9f8f5] rounded-[16px] shadow-2xl border border-alpha p-8 max-w-md w-full relative z-10"
-                >
-                  <h3 className="text-xl font-bold text-[#2d2d2d] mb-2 font-display">{modal.title}</h3>
-                  <p className="text-[#6b6b6b] mb-8 font-medium leading-relaxed">{modal.description}</p>
-                  <div className="flex justify-end gap-4">
-                    <button onClick={() => setModal(null)} className="px-6 py-2.5 font-bold text-[#6b6b6b] hover:bg-[#efebe3] rounded-[8px] transition-colors">Cancel</button>
-                    <button 
-                      onClick={() => { modal.onConfirm(); setModal(null); }} 
-                      className="px-6 py-2.5 bg-[#01696f] text-white font-bold rounded-[8px] shadow-lg shadow-[#01696f]/10 premium-transition"
-                    >
-                      {modal.confirmLabel}
-                    </button>
-                  </div>
-                </motion.div>
-              </div>
-            )}
 
             {/* Settings Drawer */}
             {isDrawerOpen && (
