@@ -20,6 +20,10 @@ import { TaskRouter, groqTools } from './constants';
 import { cleanCode, waitForOnline, fetchWithRetry } from './utils';
 import { ToastContainer } from './components/ToastContainer';
 import { ConfirmModal } from './components/ConfirmModal';
+import { FileTree } from './components/FileTree';
+import { TerminalPanel } from './components/TerminalPanel';
+import { ChatPanel } from './components/ChatPanel';
+import { LandingView } from './components/LandingView';
 
 
 
@@ -1641,181 +1645,18 @@ Return ONLY valid JSON in this exact shape:
     <div className="min-h-screen bg-[#f7f6f2] flex p-6 gap-6 max-h-screen overflow-hidden font-sans">
       {statusOverlays}
       {/* Sidebar: Chat */}
-      <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} className="w-80 lg:w-96 bg-[#f9f8f5] rounded-[12px] p-6 flex flex-col shadow-warm border border-alpha premium-transition">
-        <div className="flex justify-between items-center mb-8 px-1">
-            <h2 className="text-xl font-bold flex items-center gap-2 font-display"><BotIcon /> Orchestrator</h2>
-            <div className="flex gap-2">
-                <button onClick={startNewChatSession} className="text-[10px] bg-[#efebe3] text-[#2d2d2d] px-3.5 py-2 rounded-full border border-alpha hover:bg-[#efebe3]/80 transition font-bold uppercase tracking-wider" title="Clean AI Context">New Session</button>
-            </div>
-        </div>
-        
-        <div className="flex-1 overflow-y-auto space-y-6 mb-6 px-1 scrollbar-hide">
-            {!compressedContext && (
-                <div className="p-6 bg-[#f7f6f2] border border-alpha rounded-[8px] text-[#2d2d2d] leading-relaxed text-sm font-medium">
-                    <span className="font-bold opacity-30 uppercase tracking-[0.2em] text-[9px] mb-3 block">Initial Directive</span>
-                    {prompt}
-                </div>
-            )}
-            {compressedContext && (
-                <motion.div initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} className="p-4 bg-[#01696f]/5 border border-[#01696f]/10 rounded-[8px] text-[#01696f] text-xs flex items-center gap-3 shadow-sm font-bold">
-                    <CheckCircle2 className="w-4 h-4 shrink-0 text-[#01696f]" /> {compressedContext}
-                </motion.div>
-            )}
-            {chatHistory.map((msg, idx) => (
-                <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} key={idx} 
-                    className={`p-6 rounded-[12px] text-sm max-w-full overflow-hidden h-auto premium-transition ${
-                        msg.role === 'user' ? 'bg-[#efebe3] ml-auto text-[#2d2d2d] border border-alpha shadow-sm' : 
-                        msg.role === 'system' ? 'bg-[#2d2d2d] text-[#f7f6f2] shadow-xl my-8 w-full border border-alpha' : 
-                        msg.role === 'warning' ? 'bg-amber-50 text-amber-900 border border-amber-200 shadow-sm mx-2' :
-                        msg.role === 'tool' ? 'bg-[#f7f6f2] text-[#01696f] border border-alpha shadow-sm mx-2 overflow-wrap-anywhere break-words font-mono text-[11px]' :
-                        'bg-white border border-alpha mr-auto shadow-warm'
-                    }`}
-                >
-                    <div className={`text-[10px] uppercase font-bold mb-3 opacity-40 tracking-[0.15em] flex items-center gap-2 ${msg.role === 'system' ? 'text-[#01696f]' : ''}`}>
-                        {msg.role === 'system' ? <Server className="w-3.5 h-3.5" /> : msg.role === 'ai' ? <SparklesIcon /> : ''} {msg.role}
-                    </div>
-                    {msg.content.includes('<<<<<<< SEARCH') ? (
-                        <pre className="text-[11px] font-mono bg-[#1a1a1a] text-[#00ffc2] p-4 rounded-[8px] overflow-x-auto whitespace-pre leading-relaxed mt-3 border border-white/5">
-                            {msg.content}
-                        </pre>
-                    ) : (
-                        <div className="leading-relaxed whitespace-pre-wrap overflow-wrap-anywhere break-words font-medium">
-                            {msg.content}
-                        </div>
-                    )}
-                </motion.div>
-            ))}
-            {isGenerating && (
-                <div className="p-6 rounded-[12px] bg-white border border-alpha mr-8 shadow-warm flex items-center gap-4 text-sm text-[#6b6b6b] font-bold">
-                    <RefreshCcw className="w-4 h-4 animate-spin text-[#01696f]" /> 
-                    <span className="shimmer bg-clip-text text-transparent">Synthesizing response...</span>
-                </div>
-            )}
-            <div ref={chatEndRef} />
-        </div>
-
-        <div className="mt-auto">
-            {isGenerating && (
-              <div className="text-[9px] font-bold text-[#01696f] uppercase tracking-widest mb-2 flex items-center gap-2 px-1">
-                <div className="w-1.5 h-1.5 rounded-full bg-[#01696f] animate-pulse" />
-                Agent active — new instructions will be queued
-              </div>
-            )}
-
-            <div className="relative">
-                <textarea
-                    value={followUp}
-                    onChange={(e) => setFollowUp(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        if (!followUp.trim()) return;
-                        if (isGenerating) {
-                          addToQueue(followUp);
-                        } else {
-                          sendFollowUpDirect(followUp);
-                        }
-                        setFollowUp('');
-                      }
-                    }}
-                    placeholder={isGenerating ? "Queue next instruction — agent will execute after current task..." : "Instruct Copilot..."}
-                    className="w-full p-6 pr-16 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm focus:ring-2 focus:ring-[#01696f]/10 focus:border-[#01696f] focus:outline-none resize-none shadow-inner transition-all placeholder:text-[#6b6b6b]/40 font-medium"
-                    rows={2}
-                />
-                <button 
-                  onClick={() => {
-                    if (!followUp.trim()) return;
-                    if (isGenerating) {
-                      addToQueue(followUp);
-                      setFollowUp('');
-                    } else {
-                      sendFollowUpDirect(followUp);
-                      setFollowUp('');
-                    }
-                  }}
-                  className={`absolute right-4 bottom-4 p-3 rounded-[8px] transition scale-100 active:scale-95 ${!followUp.trim() ? 'bg-[#efebe3] text-[#6b6b6b]/30' : isGenerating ? 'bg-[#efebe3]' : 'bg-[#01696f] text-white hover:bg-[#01696f]/90 shadow-lg shadow-[#01696f]/10'}`}
-                >
-                    {isGenerating && followUp.trim() ? <List className="w-4 h-4" /> : <Send className="w-4 h-4" />}
-                </button>
-            </div>
-
-            {/* Instruction Queue Panel */}
-            <AnimatePresence>
-              {instructionQueue.length > 0 && (
-                <motion.div
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 8 }}
-                  className="mt-3 bg-[#f7f6f2] border border-alpha rounded-[10px] overflow-hidden"
-                >
-                  <div className="px-4 py-2.5 flex items-center justify-between border-b border-alpha">
-                    <span className="text-[10px] font-black uppercase tracking-widest text-[#6b6b6b] flex items-center gap-2">
-                      <List className="w-3 h-3" />
-                      QUEUED ({instructionQueue.filter(i => i.status === 'queued').length})
-                    </span>
-                    <button
-                      onClick={() => setInstructionQueue([])}
-                      className="text-[10px] text-[#6b6b6b] hover:text-red-500 font-bold premium-transition"
-                    >
-                      Clear all
-                    </button>
-                  </div>
-
-                  <div className="max-h-40 overflow-y-auto custom-scrollbar">
-                    {instructionQueue.map((item, idx) => (
-                      <motion.div
-                        key={item.id}
-                        initial={{ opacity: 0, x: -8 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, x: 8 }}
-                        transition={{ delay: idx * 0.05 }}
-                        className={`px-4 py-3 flex items-start gap-3 border-b border-alpha last:border-0
-                          ${item.status === 'processing' ? 'bg-[#01696f08]' : ''}
-                        `}
-                      >
-                        <div className="mt-0.5 shrink-0">
-                          {item.status === 'queued' && (
-                            <div className="w-2 h-2 rounded-full bg-[#6b6b6b30] border border-[#6b6b6b40]" />
-                          )}
-                          {item.status === 'processing' && (
-                            <div className="w-2 h-2 rounded-full bg-[#01696f] animate-pulse" />
-                          )}
-                          {item.status === 'done' && (
-                            <Check className="w-3 h-3 text-[#437a22]" />
-                          )}
-                          {item.status === 'failed' && (
-                            <X className="w-3 h-3 text-red-400" />
-                          )}
-                        </div>
-
-                        <p className={`text-[11px] font-medium leading-relaxed flex-1 truncate
-                          ${item.status === 'processing' ? 'text-[#01696f] font-bold' : 'text-[#6b6b6b]'}
-                          ${item.status === 'done' ? 'line-through opacity-40' : ''}
-                        `}>
-                          {item.status === 'processing' && (
-                            <span className="text-[9px] font-black uppercase tracking-widest block text-[#01696f] mb-1">
-                              ↳ Executing...
-                            </span>
-                          )}
-                          {item.instruction}
-                        </p>
-
-                        {item.status === 'queued' && (
-                          <button
-                            onClick={() => setInstructionQueue(prev => prev.filter(i => i.id !== item.id))}
-                            className="shrink-0 opacity-30 hover:opacity-100 premium-transition"
-                          >
-                            <X className="w-3 h-3 text-[#6b6b6b]" />
-                          </button>
-                        )}
-                      </motion.div>
-                    ))}
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-        </div>
-      </motion.div>
+      <ChatPanel
+        chatHistory={chatHistory}
+        followUp={followUp}
+        setFollowUp={setFollowUp}
+        isGenerating={isGenerating}
+        sendFollowUpDirect={sendFollowUpDirect}
+        queueInput={queueInput}
+        setQueueInput={setQueueInput}
+        instructionQueue={instructionQueue}
+        addToQueue={addToQueue}
+        chatEndRef={chatEndRef}
+      />
 
       {/* Main Workspace */}
       <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="flex-1 bg-[#f9f8f5] rounded-[12px] flex flex-col shadow-warm border border-alpha overflow-hidden premium-transition">
@@ -1937,186 +1778,17 @@ Return ONLY valid JSON in this exact shape:
                     </motion.div>
                 )}
 
-                <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    {/* Integrated Terminal with Streaming & Syntax */}
-                    <div className="bg-[#1e1e1e] rounded-[12px] shadow-2xl border border-white/5 flex flex-col overflow-hidden">
-                        <div className="bg-[#2d2d2d] px-6 py-4 flex justify-between items-center border-b border-white/5">
-                            <div className="flex items-center gap-3">
-                                <TerminalIcon className="w-4 h-4 text-[#01696f]" />
-                                <span className="text-[11px] font-bold text-[#f7f6f2] uppercase tracking-[0.2em] font-mono">Autonomous Console</span>
-                            </div>
-                            <div className="flex gap-4">
-                                <button className="p-1.5 text-white/30 hover:text-white/60 transition-colors" title="Clear Terminal" onClick={() => setTerminalEntries([])}>
-                                    <Trash2 className="w-4 h-4" />
-                                </button>
-                                <div className="w-3 h-3 rounded-full bg-[#ff5f56]" />
-                                <div className="w-3 h-3 rounded-full bg-[#ffbd2e]" />
-                                <div className="w-3 h-3 rounded-full bg-[#27c93f]" />
-                            </div>
-                        </div>
-                        <div className="flex-1 p-6 overflow-y-auto custom-scrollbar font-mono text-[13px] leading-relaxed bg-[#1a1a1a]">
-                            <div className="space-y-4">
-                                {terminalEntries.length === 0 && (
-                                    <div className="opacity-20 flex flex-col items-center justify-center py-24 gap-4">
-                                        <Bot className="w-12 h-12" />
-                                        <p className="text-[10px] uppercase font-bold tracking-[0.3em]">Awaiting Cluster Handshake...</p>
-                                    </div>
-                                )}
-                                {terminalEntries.map(entry => (
-                                    <div key={entry.id} className="animate-in fade-in slide-in-from-left-2 duration-300">
-                                        <div className="flex items-center gap-3 mb-1.5 overflow-hidden">
-                                            {entry.source === 'ai' ? <Bot className="w-4 h-4 text-[#01696f]" /> : <User className="w-4 h-4 text-white/30" />}
-                                            <span className="text-[#39ff14] opacity-80 shrink-0 select-none font-bold">$</span>
-                                            <span className="text-amber-400 font-bold break-all flex-1">{entry.command}</span>
-                                            {entry.status === 'running' && <RefreshCcw className="w-3 h-3 text-[#01696f] animate-spin shrink-0" />}
-                                            {entry.status === 'success' && <ShieldCheck className="w-4 h-4 text-[#27c93f] shrink-0" />}
-                                            {entry.status === 'error' && <AlertCircle className="w-4 h-4 text-[#ff5f56] shrink-0" />}
-                                        </div>
-                                        {entry.output && (
-                                            <pre className={`pl-8 whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed mb-6 ${entry.status === 'error' ? 'text-red-400/80 bg-red-950/20 p-4 rounded-[6px] border border-red-500/10' : 'text-[#f7f6f2]/80'}`}>
-                                                {entry.output}
-                                            </pre>
-                                        )}
-                                    </div>
-                                ))}
-                                <div ref={terminalEndRef} />
-                            </div>
-                        </div>
-                    </div>
+                <TerminalPanel terminalEntries={terminalEntries} setTerminalEntries={setTerminalEntries} commandQueue={commandQueue} setCommandQueue={setCommandQueue} aiExecuteMode={aiExecuteMode} setAiExecuteMode={setAiExecuteMode} executeAllQueued={executeAllQueued} runTerminalCommand={runTerminalCommand} terminalEndRef={terminalEndRef} />
 
-                    {/* Command Queue & Infrastructure Manifest */}
-                    <div className="flex flex-col gap-8 overflow-hidden">
-                        {/* Command Queue */}
-                        <div className="bg-[#f9f8f5] rounded-[12px] border border-alpha shadow-warm flex flex-col max-h-[50%] overflow-hidden">
-                            <div className="p-6 border-b border-alpha flex justify-between items-center bg-[#efebe3]/30">
-                                <div className="flex items-center gap-3">
-                                    <List className="w-4 h-4 text-[#2d2d2d]" />
-                                    <h3 className="text-xs font-bold uppercase tracking-[0.2em] font-display">Command Pipeline</h3>
-                                    {commandQueue.length > 0 && <span className="bg-[#01696f] text-white text-[10px] px-2 py-0.5 rounded-full">{commandQueue.length}</span>}
-                                </div>
-                                {commandQueue.length > 0 && (
-                                    <button 
-                                        onClick={executeAllQueued}
-                                        className="text-[10px] font-bold text-[#01696f] hover:underline flex items-center gap-2 uppercase tracking-widest"
-                                    >
-                                        <Play className="w-3 h-3 fill-current" /> Run All
-                                    </button>
-                                )}
-                            </div>
-                            <div className="flex-1 overflow-y-auto p-6 space-y-4 custom-scrollbar">
-                                {commandQueue.length === 0 ? (
-                                    <div className="py-12 text-center opacity-30 flex flex-col items-center gap-3">
-                                        <SkipForward className="w-8 h-8" />
-                                        <p className="text-[10px] font-bold uppercase tracking-widest">No pending operations</p>
-                                    </div>
-                                ) : (
-                                    <div className="space-y-3">
-                                        {commandQueue.map(item => (
-                                            <motion.div 
-                                                key={item.id} 
-                                                layout
-                                                initial={{ opacity: 0, scale: 0.95 }}
-                                                animate={{ opacity: 1, scale: 1 }}
-                                                exit={{ opacity: 0, scale: 0.9 }}
-                                                className="bg-white p-5 rounded-[10px] border border-alpha shadow-sm hover:shadow-md premium-transition group"
-                                            >
-                                                <div className="flex items-center gap-4 mb-4">
-                                                    <div className="w-2 h-2 rounded-full bg-[#01696f]/40 group-hover:scale-125 transition-transform" />
-                                                    <code className="text-xs font-mono text-[#01696f] font-bold break-all flex-1">{item.command}</code>
-                                                </div>
-                                                <div className="flex gap-3">
-                                                    <button 
-                                                        onClick={async () => {
-                                                            setCommandQueue(prev => prev.filter(q => q.id !== item.id));
-                                                            await runTerminalCommand(item.command, item.workdir, 'ai');
-                                                        }}
-                                                        className="flex-1 bg-[#efebe3] hover:bg-[#01696f] hover:text-white text-[10px] py-2.5 rounded-[6px] font-bold uppercase tracking-widest premium-transition"
-                                                    >
-                                                        Permit
-                                                    </button>
-                                                    <button 
-                                                        onClick={() => setCommandQueue(prev => prev.filter(q => q.id !== item.id))}
-                                                        className="px-4 text-[#6b6b6b] hover:text-[#ff5f56] hover:bg-[#ff5f56]/10 rounded-[6px] premium-transition"
-                                                    >
-                                                        <SkipForward className="w-4 h-4" />
-                                                    </button>
-                                                </div>
-                                            </motion.div>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        </div>
-
-                        {/* Visualization / Deployment Matrix (Mock) */}
-                        <div className="flex-1 bg-[#f9f8f5] rounded-[12px] border border-alpha shadow-warm p-8 flex flex-col gap-6 overflow-y-auto custom-scrollbar">
-                           <div className="flex items-center justify-between border-b border-alpha pb-6">
-                              <h3 className="text-xs font-bold uppercase tracking-[0.2em] font-display">Cluster Observability</h3>
-                              <div className="px-3 py-1 bg-[#01696f]/10 text-[#01696f] text-[9px] font-bold rounded-full border border-[#01696f]/20 uppercase tracking-widest">Global Edge Active</div>
-                           </div>
-                           <div className="grid grid-cols-2 gap-6">
-                                <div className="p-5 bg-white rounded-[10px] border border-alpha shadow-sm">
-                                    <div className="text-[10px] font-bold text-[#6b6b6b] uppercase tracking-widest mb-3">Orchestration</div>
-                                    <div className="text-2xl font-bold font-display text-[#01696f]">4.2<span className="text-xs opacity-40 ml-1">vCPUs</span></div>
-                                    <div className="w-full h-1 bg-[#efebe3] rounded-full mt-4 overflow-hidden">
-                                        <motion.div initial={{ width: 0 }} animate={{ width: '65%' }} className="h-full bg-[#01696f]" />
-                                    </div>
-                                </div>
-                                <div className="p-5 bg-white rounded-[10px] border border-alpha shadow-sm">
-                                    <div className="text-[10px] font-bold text-[#6b6b6b] uppercase tracking-widest mb-3">Sync Latency</div>
-                                    <div className="text-2xl font-bold font-display text-[#2d2d2d]">12<span className="text-xs opacity-40 ml-1">ms</span></div>
-                                    <div className="w-full h-1 bg-[#efebe3] rounded-full mt-4 overflow-hidden">
-                                        <motion.div initial={{ width: 0 }} animate={{ width: '20%' }} className="h-full bg-[#01696f]" />
-                                    </div>
-                                </div>
-                           </div>
-                           
-                           <div className="p-6 bg-[#2d2d2d] rounded-[10px] text-[#efebe3] font-mono text-[11px] leading-relaxed shadow-xl border border-white/5 relative overflow-hidden group">
-                                <div className="absolute top-0 right-0 p-4 opacity-[0.05] group-hover:scale-110 transition-transform">
-                                    <Globe className="w-16 h-16" />
-                                </div>
-                                <div className="text-[#01696f] font-bold mb-4 flex items-center gap-2">
-                                    <RefreshCcw className="w-3 h-3 animate-spin" />
-                                    <span>VIRTUAL_MESH_HEARTBEAT</span>
-                                </div>
-                                <div className="space-y-1">
-                                    <p className="opacity-60">NODE_VERCEL_EDGE_01: STABLE</p>
-                                    <p className="opacity-60">NODE_NVIDIA_NIM_CORP: OPTIONAL_SYNC</p>
-                                    <p className="opacity-100 font-bold">NODE_LOCAL_ARCHITECT: ACTIVE_SYNC</p>
-                                </div>
-                           </div>
-                        </div>
-                    </div>
                 </div>
             </motion.div>
           )}
 
           {activeTab === 'codebase' && (
             <div className="h-full flex p-8 gap-8 bg-[#f7f6f2]">
-                <div className="w-72 flex flex-col bg-[#f9f8f5] border border-alpha rounded-[12px] shadow-sm overflow-hidden stagger-fade-in">
-                    <div className="px-6 py-5 border-b border-alpha bg-[#f7f6f2]">
-                        <h3 className="text-[10px] font-bold text-[#6b6b6b] uppercase tracking-[0.25em]">Repository</h3>
-                    </div>
-                    <ul className="p-4 space-y-1.5 overflow-y-auto custom-scrollbar">
-                        {Object.keys(projectFiles).length === 0 && <li className="text-xs text-[#6b6b6b] italic p-3 px-4 opacity-50">No files generated yet.</li>}
-                        {Object.keys(projectFiles).map(name => {
-                            const ext = name.substring(name.lastIndexOf('.'));
-                            const extColor = ext === '.tsx' || ext === '.ts' ? 'text-[#01696f]' : ext === '.py' ? 'text-blue-500' : 'text-[#6b6b6b]';
-                            return (
-                                <li key={name} 
-                                    onClick={() => setSelectedFile(name)} 
-                                    onContextMenu={(e) => {
-                                        e.preventDefault();
-                                        setContextMenu({ x: e.clientX, y: e.clientY, fileName: name });
-                                    }}
-                                    className={`cursor-pointer text-[13px] py-1.5 px-4 rounded-[6px] flex items-center gap-3 transition-all font-mono group ${selectedFile === name ? 'bg-[#01696f]/10 text-[#01696f] border-l-2 border-[#01696f] translate-x-1' : 'text-[#6b6b6b] hover:bg-[#efebe3] hover:text-[#2d2d2d]'}`}>
-                                    <FileCode className={`w-3.5 h-3.5 ${selectedFile === name ? 'text-[#01696f]' : 'text-[#6b6b6b]/40'}`} />
-                                    <span className="truncate flex-1">{name.split(ext)[0]}<span className={`opacity-80 ${extColor}`}>{ext}</span></span>
-                                </li>
-                            );
-                        })}
-                    </ul>
-                </div>
+                <div className="w-72">
+              <FileTree projectFiles={projectFiles} selectedFile={selectedFile} setSelectedFile={setSelectedFile} contextMenu={contextMenu} setContextMenu={setContextMenu} confirmAction={confirmAction} showToast={showToast} />
+            </div>
                 <div className="flex-1 bg-white rounded-[12px] border border-alpha shadow-2xl overflow-hidden flex flex-col relative stagger-fade-in" style={{ animationDelay: '150ms' }}>
                     <div className="bg-[#f9f8f5] px-6 py-3 border-b border-alpha flex items-center justify-between">
                         <div className="flex items-center gap-4">
