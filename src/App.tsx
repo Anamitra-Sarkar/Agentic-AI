@@ -103,7 +103,8 @@ const TaskRouter = {
     apiInterfaces: { provider: 'openrouter', model: 'google/gemma-4-31b-it:free', fallback: { provider: 'groq', model: 'llama-3.3-70b-versatile' } },
     frontendReact: { provider: 'openrouter', model: 'z-ai/glm-4.5-air:free' },
     edgeCasesDocs: { provider: 'openrouter', model: 'openai/gpt-oss-120b:free', fallback: { provider: 'groq', model: 'openai/gpt-oss-120b' } },
-    validation: { provider: 'groq', model: 'openai/gpt-oss-120b' } // Heavyweight for validation
+    validation: { provider: 'groq', model: 'openai/gpt-oss-120b' }, // Heavyweight for validation
+    cloneMode: { provider: 'nvidia', model: 'qwen3-coder-480b-a35b-instruct', fallback: { provider: 'openrouter', model: 'nvidia/nemotron-3-super-120b-a12b:free' } }
 } as const;
 
 type TaskConfig = typeof TaskRouter[keyof typeof TaskRouter];
@@ -128,6 +129,11 @@ export default function App() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [compressedContext, setCompressedContext] = useState<string>('');
   
+  const [cloneUrl, setCloneUrl] = useState('');
+  const [isUrlMode, setIsUrlMode] = useState(false);
+  const [cloneProgress, setCloneProgress] = useState<number>(0);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+
   const [activeTab, setActiveTab] = useState<Tab>('workspace');
   const [projectFiles, setProjectFiles] = useState<Record<string, string>>({});
   const filesSnapshotRef = useRef<Record<string, string>>({});
@@ -139,7 +145,80 @@ export default function App() {
 
   const [selectedFile, setSelectedFile] = useState<string>('');
   const [isGenerating, setIsGenerating] = useState(false);
+  const [cursorPos, setCursorPos] = useState({ line: 1, col: 1 });
   
+  // Preview State
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  
+  const startPreview = async () => {
+    if (!activeSession) return showToast('Save a session first', 'warning');
+    setIsPreviewLoading(true);
+    try {
+      const res = await fetch(`/api/sessions/${activeSession.id}/preview/start`, { method: 'POST' });
+      const { url } = await res.json();
+      setPreviewUrl(url);
+    } catch (e) {
+      showToast('Preview server failed to start', 'error');
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  };
+  
+  // Monaco Refs
+  const monacoRef = useRef<any>(null);
+  const editorRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (!selectedFile || !projectFiles[selectedFile]) return;
+    const langMap: Record<string, string> = {
+      '.tsx': 'typescript', '.ts': 'typescript', '.jsx': 'javascript',
+      '.js': 'javascript', '.py': 'python', '.css': 'css',
+      '.json': 'json', '.md': 'markdown', '.html': 'html'
+    };
+    const ext = selectedFile.substring(selectedFile.lastIndexOf('.'));
+    const language = langMap[ext] || 'plaintext';
+
+    if (editorRef.current) {
+      editorRef.current.dispose();
+    }
+
+    (window as any).require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs' } });
+    (window as any).require(['vs/editor/editor.main'], (monaco: any) => {
+      monacoRef.current = monaco;
+      const container = document.getElementById('monaco-container');
+      if (!container) return;
+      
+      editorRef.current = monaco.editor.create(container, {
+        value: projectFiles[selectedFile] || '',
+        language,
+        theme: 'vs-light',
+        fontSize: 13,
+        fontFamily: '"JetBrains Mono", monospace',
+        minimap: { enabled: true },
+        wordWrap: 'on',
+        scrollBeyondLastLine: false,
+        automaticLayout: true,
+        padding: { top: 16 },
+        lineNumbers: 'on',
+        renderLineHighlight: 'line',
+        smoothScrolling: true,
+      });
+
+      editorRef.current.onDidChangeModelContent(() => {
+        const value = editorRef.current.getValue();
+        handleFileChange(selectedFile, value);
+      });
+
+      editorRef.current.onDidChangeCursorPosition((e: any) => {
+        setCursorPos({ line: e.position.lineNumber, col: e.position.column });
+      });
+    });
+
+    return () => { editorRef.current?.dispose(); };
+  }, [selectedFile]);
+
   // Persistence State
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSession, setActiveSession] = useState<Session | null>(null);
@@ -548,6 +627,74 @@ export default function App() {
       return '';
   };
 
+  const handleCloneFromUrl = async () => {
+    if (!cloneUrl.trim()) return showToast('Enter a valid URL', 'warning');
+    setIsAnalyzing(true);
+    setCloneProgress(1);
+
+    try {
+      const res = await fetch('/api/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: cloneUrl })
+      });
+      const data = await res.json();
+      
+      if (data.error) throw new Error(data.error);
+
+      // Simulate step analysis for UI
+      await new Promise(r => setTimeout(r, 800));
+      setCloneProgress(2);
+      await new Promise(r => setTimeout(r, 800));
+      setCloneProgress(3);
+      await new Promise(r => setTimeout(r, 800));
+      setCloneProgress(4);
+      await new Promise(r => setTimeout(r, 800));
+
+      const clonePrompt = `
+CLONE TARGET: ${cloneUrl}
+TITLE: ${data.title}
+DESCRIPTION: ${data.metaDescription}
+
+VISUAL IDENTITY:
+- Detected color palette: ${data.colors.join(', ')}
+- Detected fonts: ${data.fonts.join(', ')}
+
+LAYOUT STRUCTURE (${data.sections.length} sections detected):
+${data.sections.map((s: any, i: number) => `${i+1}. <${s.tag}> "${s.text}"`).join('\n')}
+
+NAVIGATION ITEMS: ${data.links.slice(0, 8).join(' | ')}
+KEY HEADINGS: ${data.headings.slice(0, 8).join(' | ')}
+CONTENT SAMPLE: ${data.bodyText.substring(0, 800)}
+
+INSTRUCTIONS:
+Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
+- Match the color palette exactly using the detected colors above
+- Recreate every detected section with similar layout and content
+- Use the same navigation structure
+- Make it fully responsive
+- Add smooth scroll animations between sections
+- Backend: FastAPI with a /api/health endpoint
+`;
+
+      const ns = await createSession(data.title || 'Cloned Project');
+      if (ns) {
+          setActiveSession(ns);
+          setPrompt(clonePrompt);
+          setRectifiedPrompt(clonePrompt);
+          // Auto-trigger build
+          setTimeout(() => {
+              handleApproveAndBuild();
+          }, 500);
+      }
+    } catch (e: any) {
+      showToast(`Analysis failed: ${e.message}`, 'error');
+    } finally {
+      setIsAnalyzing(false);
+      setCloneProgress(0);
+    }
+  }
+
   const rectifyPrompt = async (input: string) => {
     setStatus('rectifying');
     setPrompt(input);
@@ -570,11 +717,16 @@ export default function App() {
     
     const logger = (msg: string, role: ChatMessage['role'] = 'system') => setChatHistory(prev => [...prev, { role, content: msg }]);
     
+    // Detect Clone Mode
+    const isClone = rectifiedPrompt.trim().startsWith('CLONE TARGET:');
+    const taskConfig = isClone ? TaskRouter.cloneMode : TaskRouter.draft;
+    const additionalInstruction = isClone ? "\nThis is a pixel-accurate clone task. Match the visual design, colors, layout structure, and content hierarchy as closely as possible. Do NOT add generic placeholder content." : "";
+
     // PHASE 1: PLAN (Manifest Generation & SOUL.md Integration)
     logger('PHASE 1: Extracting Project Soul...');
     setActiveAgents({ 'Architect': TaskRouter.rectification.model });
     
-    const projectSoul = `# SOUL.md - Project Integrity State\n\n## Tech Stack\n- Backend: Python 3.10 (FastAPI)\n- Frontend: React 19 + Tailwind CSS\n- UI Style: Frosted Neon\n\n## Design System (The Vibe)\n- Spec: ${rectifiedPrompt.substring(0, 500)}\n\n## Verification Status\n- Build Status: Awaiting Pulse Check\n`;
+    const projectSoul = `# SOUL.md - Project Integrity State\n\n## Tech Stack\n- Backend: ${isClone ? 'Python 3.10 (FastAPI)' : 'Python 3.10 (FastAPI)'}\n- Frontend: React 19 + Tailwind CSS\n- UI Style: ${isClone ? 'Identical Clone' : 'Frosted Neon'}\n\n## Design System (The Vibe)\n- Spec: ${rectifiedPrompt.substring(0, 500)}\n\n## Verification Status\n- Build Status: Awaiting Pulse Check\n`;
     let currentFiles: Record<string, string> = { 'SOUL.md': projectSoul };
 
     // 1. Tool Controller Phase
@@ -596,15 +748,15 @@ export default function App() {
     }
 
     // PHASE 1: DRAFT (Surgical Logic via Scout)
-    logger('PHASE 1: "The Draft" - Synthesizing pure Python/React logic...', 'system');
-    setActiveAgents({ 'Drafting': TaskRouter.draft.model });
+    logger(`PHASE 1: "The Draft" - Synthesizing full stack ${isClone ? 'clone' : 'logic'}...`, 'system');
+    setActiveAgents({ 'Drafting': taskConfig.model });
     
     const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
-        callAPI(TaskRouter.draft, 'DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.', `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
-        callAPI(TaskRouter.draft, 'DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.', `Build React frontend for: ${rectifiedPrompt}`, false, logger),
-        callAPI(TaskRouter.draft, 'DRAFT PHASE: Generate Tailwind @layer CSS for "Frosted Neon" theme.', `CSS for: ${rectifiedPrompt}`, false, logger),
-        callAPI(TaskRouter.draft, 'DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).', `Requirements for: ${rectifiedPrompt}`, false, logger),
-        callAPI(TaskRouter.draft, 'DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.', `Dockerfile for: ${rectifiedPrompt}`, false, logger)
+        callAPI(taskConfig, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
+        callAPI(taskConfig, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
+        callAPI(taskConfig, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
+        callAPI(taskConfig, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
+        callAPI(taskConfig, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
     ]);
 
     const initialFiles = {
@@ -964,28 +1116,88 @@ export default function App() {
                   Vibe Control Center
               </div>
               {status === 'idle' && (
-                <div className="flex flex-col sm:flex-row gap-6 w-full">
-                  <textarea
-                    className="flex-1 w-full p-6 bg-[#f7f6f2] border border-alpha rounded-[8px] focus:ring-2 focus:ring-[#01696f]/20 focus:border-[#01696f] focus:outline-none resize-none transition-all placeholder:text-[#6b6b6b]/50 text-sm font-medium"
-                    placeholder="Describe your next massive project..."
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    rows={2}
-                  />
-                  <motion.button
-                    whileHover={{ scale: 1.01 }}
-                    whileTap={{ scale: 0.98 }}
-                    className="w-full sm:w-auto py-6 px-14 bg-[#01696f] text-white rounded-[8px] font-bold premium-transition shadow-lg shadow-[#01696f]/10"
-                    onClick={async () => {
-                        const ns = await createSession(prompt.substring(0, 30) || "Dynamic Venture");
-                        if (ns) {
-                            setActiveSession(ns);
-                            rectifyPrompt(prompt);
-                        }
-                    }}
-                  >
-                    Rectify & Inspect
-                  </motion.button>
+                <div className="flex flex-col gap-6 w-full">
+                  {!isUrlMode ? (
+                    <>
+                      <textarea
+                        className="flex-1 w-full p-6 bg-[#f7f6f2] border border-alpha rounded-[8px] focus:ring-2 focus:ring-[#01696f]/20 focus:border-[#01696f] focus:outline-none resize-none transition-all placeholder:text-[#6b6b6b]/50 text-sm font-medium"
+                        placeholder="Describe your next massive project..."
+                        value={prompt}
+                        onChange={(e) => setPrompt(e.target.value)}
+                        rows={3}
+                      />
+                      <div className="flex justify-between items-center">
+                        <button 
+                          onClick={() => setIsUrlMode(true)}
+                          className="text-[10px] font-bold text-[#6b6b6b] hover:text-[#01696f] uppercase tracking-widest premium-transition"
+                        >
+                          Or clone from URL
+                        </button>
+                        <motion.button 
+                          whileHover={{ scale: 1.01 }}
+                          whileTap={{ scale: 0.98 }}
+                          onClick={async () => {
+                              const ns = await createSession(prompt.substring(0, 30) || "Dynamic Venture");
+                              if (ns) {
+                                  setActiveSession(ns);
+                                  rectifyPrompt(prompt);
+                              }
+                          }}
+                          disabled={!prompt.trim()}
+                          className="px-12 py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-xl shadow-[#01696f]/20 premium-transition hover:translate-y-[-2px] active:scale-95 disabled:opacity-50 disabled:translate-y-0 flex items-center gap-3"
+                        >
+                          <SparklesIcon />
+                          Initiate Build
+                        </motion.button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="space-y-6">
+                      <div className="flex flex-col sm:flex-row gap-4">
+                        <div className="flex-1 relative">
+                          <Globe className="absolute left-6 top-1/2 -translate-y-1/2 w-4 h-4 text-[#01696f]" />
+                          <input 
+                            type="text"
+                            placeholder="https://example.com — paste any website"
+                            className="w-full pl-14 pr-6 py-4 bg-[#f7f6f2] border border-alpha rounded-[8px] focus:ring-2 focus:ring-[#01696f]/20 focus:border-[#01696f] focus:outline-none text-sm font-medium"
+                            value={cloneUrl}
+                            onChange={(e) => setCloneUrl(e.target.value)}
+                          />
+                        </div>
+                        <button 
+                          onClick={handleCloneFromUrl}
+                          disabled={isAnalyzing || !cloneUrl.trim()}
+                          className="px-10 py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-xl shadow-[#01696f]/20 premium-transition hover:translate-y-[-2px] active:scale-95 disabled:opacity-50 flex items-center justify-center gap-3 whitespace-nowrap min-w-[220px]"
+                        >
+                          {isAnalyzing ? <RefreshCcw className="w-4 h-4 animate-spin" /> : <Globe className="w-4 h-4" />}
+                          Analyze & Clone
+                        </button>
+                      </div>
+                      
+                      {isAnalyzing && (
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 animate-in fade-in slide-in-from-bottom-2">
+                          {[
+                            "Scraping layout structure...",
+                            "Extracting color palette...",
+                            "Mapping component hierarchy...",
+                            "Synthesizing clone specification..."
+                          ].map((step, i) => (
+                            <div key={i} className={`flex items-center gap-3 p-4 rounded-[8px] border premium-transition ${cloneProgress > i ? 'bg-[#01696f]/5 border-[#01696f]/20 opacity-100' : 'bg-transparent border-alpha opacity-30'}`}>
+                              {cloneProgress > i ? <Check className="w-3.5 h-3.5 text-[#01696f]" /> : <div className="w-3.5 h-3.5 rounded-full border border-current" />}
+                              <span className="text-[10px] font-bold uppercase tracking-tight truncate">{step}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <button 
+                        onClick={() => { setIsUrlMode(false); setIsAnalyzing(false); setCloneProgress(0); }}
+                        className="text-[10px] font-bold text-[#6b6b6b] hover:text-[#01696f] uppercase tracking-widest premium-transition mt-2"
+                      >
+                        ← Back to standard prompt
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
               
@@ -1141,7 +1353,10 @@ export default function App() {
                 return (
                     <button
                         key={tab}
-                        onClick={() => setActiveTab(tab)}
+                        onClick={() => {
+                            setActiveTab(tab);
+                            if (tab === 'preview') startPreview();
+                        }}
                         className={`flex items-center gap-3 px-8 py-4 text-sm font-bold transition-all capitalize relative rounded-t-[8px] ${activeTab === tab ? 'bg-[#f9f8f5] text-[#01696f] border-t border-x border-alpha shadow-sm' : 'text-[#6b6b6b] hover:text-[#2d2d2d] hover:bg-[#efebe3]/50'}`}
                     >
                         <Icon className="w-4 h-4" />
@@ -1364,88 +1579,143 @@ export default function App() {
                     </div>
                     <ul className="p-4 space-y-1.5 overflow-y-auto custom-scrollbar">
                         {Object.keys(projectFiles).length === 0 && <li className="text-xs text-[#6b6b6b] italic p-3 px-4 opacity-50">No files generated yet.</li>}
-                        {Object.keys(projectFiles).map(name => (
-                            <li key={name} 
-                                onClick={() => setSelectedFile(name)} 
-                                onContextMenu={(e) => {
-                                    e.preventDefault();
-                                    setContextMenu({ x: e.clientX, y: e.clientY, fileName: name });
-                                }}
-                                className={`cursor-pointer text-[13px] py-3 px-4 rounded-[8px] flex items-center gap-3.5 transition-all font-mono leading-none ${selectedFile === name ? 'bg-[#01696f]/5 text-[#01696f] font-bold border border-[#01696f]/10 translate-x-1' : 'text-[#6b6b6b] hover:bg-[#efebe3] hover:text-[#2d2d2d] border border-transparent'}`}>
-                                <FileCode className={`w-4 h-4 ${selectedFile === name ? 'text-[#01696f]' : 'text-[#6b6b6b]/40'}`} />
-                                {name}
-                            </li>
-                        ))}
+                        {Object.keys(projectFiles).map(name => {
+                            const ext = name.substring(name.lastIndexOf('.'));
+                            const extColor = ext === '.tsx' || ext === '.ts' ? 'text-[#01696f]' : ext === '.py' ? 'text-blue-500' : 'text-[#6b6b6b]';
+                            return (
+                                <li key={name} 
+                                    onClick={() => setSelectedFile(name)} 
+                                    onContextMenu={(e) => {
+                                        e.preventDefault();
+                                        setContextMenu({ x: e.clientX, y: e.clientY, fileName: name });
+                                    }}
+                                    className={`cursor-pointer text-[13px] py-1.5 px-4 rounded-[6px] flex items-center gap-3 transition-all font-mono group ${selectedFile === name ? 'bg-[#01696f]/10 text-[#01696f] border-l-2 border-[#01696f] translate-x-1' : 'text-[#6b6b6b] hover:bg-[#efebe3] hover:text-[#2d2d2d]'}`}>
+                                    <FileCode className={`w-3.5 h-3.5 ${selectedFile === name ? 'text-[#01696f]' : 'text-[#6b6b6b]/40'}`} />
+                                    <span className="truncate flex-1">{name.split(ext)[0]}<span className={`opacity-80 ${extColor}`}>{ext}</span></span>
+                                </li>
+                            );
+                        })}
                     </ul>
                 </div>
-                <div className="flex-1 bg-[#1a1a1a] rounded-[12px] border border-white/5 shadow-2xl overflow-hidden flex flex-col relative stagger-fade-in" style={{ animationDelay: '150ms' }}>
-                    <div className="bg-[#2d2d2d] px-6 py-3 border-b border-white/5 flex items-center justify-between">
+                <div className="flex-1 bg-white rounded-[12px] border border-alpha shadow-2xl overflow-hidden flex flex-col relative stagger-fade-in" style={{ animationDelay: '150ms' }}>
+                    <div className="bg-[#f9f8f5] px-6 py-3 border-b border-alpha flex items-center justify-between">
                         <div className="flex items-center gap-4">
-                            <div className="flex gap-2"><div className="w-3 h-3 rounded-full bg-rose-500/30"></div><div className="w-3 h-3 rounded-full bg-amber-500/30"></div><div className="w-3 h-3 rounded-full bg-emerald-500/30"></div></div>
-                            <span className="text-[#efebe3]/60 font-mono text-[11px] ml-4 tracking-[0.1em]">{selectedFile || 'SELECT_FILE'}</span>
+                            <span className="text-[#2d2d2d] font-bold font-mono text-[11px]">{selectedFile || 'PROJECT_ROOT'}</span>
+                            {selectedFile && (
+                                <div className="px-2 py-0.5 bg-[#01696f]/5 text-[#01696f] text-[9px] font-bold rounded uppercase tracking-widest border border-[#01696f]/10">
+                                    {selectedFile.substring(selectedFile.lastIndexOf('.') + 1) || 'text'}
+                                </div>
+                            )}
+                            <div className="h-4 w-px bg-alpha mx-2" />
+                            <span className="text-[10px] font-mono text-[#6b6b6b] font-bold">LN {cursorPos.line}, COL {cursorPos.col}</span>
                         </div>
-                        {isRecompiling && (
-                            <span className="text-[10px] font-bold text-[#01696f] uppercase tracking-[0.2em] flex items-center gap-2.5"><RefreshCcw className="w-3 h-3 animate-spin"/> Handshaking...</span>
-                        )}
-                        {!isRecompiling && Object.keys(projectFiles).length > 0 && (
-                            <span className="text-[10px] font-bold text-[#01696f] uppercase tracking-[0.2em] flex items-center gap-2">
-                              <div className="w-1.5 h-1.5 rounded-full bg-[#01696f]"></div> Synchronized
-                            </span>
-                        )}
+                        <div className="flex items-center gap-4">
+                            {selectedFile && (
+                                <button 
+                                    onClick={() => {
+                                        navigator.clipboard.writeText(projectFiles[selectedFile]);
+                                        showToast('Code copied to clipboard', 'success');
+                                    }}
+                                    className="p-1.5 hover:bg-[#efebe3] rounded-[6px] text-[#6b6b6b] transition-colors"
+                                    title="Copy Code"
+                                >
+                                    <Copy className="w-4 h-4" />
+                                </button>
+                            )}
+                            {isRecompiling && (
+                                <span className="text-[10px] font-bold text-[#01696f] uppercase tracking-[0.2em] flex items-center gap-2.5"><RefreshCcw className="w-3 h-3 animate-spin"/> Handshaking...</span>
+                            )}
+                        </div>
                     </div>
-                    <textarea 
-                        className="flex-1 bg-transparent text-[#efebe3] font-mono text-[14px] p-8 overflow-auto resize-none focus:outline-none leading-relaxed selection:bg-[#01696f]/30"
-                        value={selectedFile ? projectFiles[selectedFile] || '' : '// Awaiting handshake...'}
-                        onChange={(e) => handleFileChange(selectedFile, e.target.value)}
-                        disabled={!selectedFile}
-                        spellCheck={false}
-                    />
+                    {selectedFile ? (
+                        <div id="monaco-container" className="flex-1 w-full h-full min-h-0" />
+                    ) : (
+                        <div className="flex-1 flex flex-col items-center justify-center bg-[#f9f8f5] opacity-40 gap-4">
+                            <BotIcon />
+                            <p className="text-[10px] font-bold uppercase tracking-[0.3em]">SELECT SOURCE TO INTEGRATE</p>
+                        </div>
+                    )}
                 </div>
             </div>
           )}
 
           {activeTab === 'preview' && (
             <div className="h-full p-8 bg-[#f7f6f2]">
-               {projectFiles['index.html'] ? (
-                   <div className="w-full h-full bg-white rounded-[12px] border border-alpha overflow-hidden shadow-warm flex flex-col relative stagger-fade-in">
-                       <div className="bg-[#f9f8f5] border-b border-alpha px-6 py-3 flex items-center gap-6">
-                           <div className="flex gap-2"><div className="w-3 h-3 rounded-full bg-[#efebe3]"></div><div className="w-3 h-3 rounded-full bg-[#efebe3]"></div><div className="w-3 h-3 rounded-full bg-[#efebe3]"></div></div>
-                           <div className="flex-1 bg-[#f7f6f2] rounded-full border border-alpha px-5 py-1.5 flex items-center gap-3">
-                               <Globe className="w-3.5 h-3.5 text-[#01696f]" />
-                               <span className="text-[11px] font-mono text-[#6b6b6b] tracking-wider uppercase opacity-60">Architect_Edge://Pulse_Live</span>
-                           </div>
-                           <div className="flex items-center gap-2 px-3 py-1 bg-[#01696f]/5 text-[#01696f] rounded-full border border-[#01696f]/10">
-                               <CheckCircle2 className="w-3 h-3" />
-                               <span className="text-[10px] font-bold uppercase tracking-widest">Verified</span>
-                           </div>
-                       </div>
-                       <div className="flex-1 bg-white relative">
-                        {isGenerating && (
-                            <div className="absolute inset-0 bg-[#f9f8f5]/80 backdrop-blur-sm z-10 flex flex-col items-center justify-center gap-4">
-                                <RefreshCcw className="w-8 h-8 text-[#01696f] animate-spin" />
-                                <span className="text-xs font-bold text-[#01696f] uppercase tracking-[0.2em] font-sans">Hot Reloading State Tree...</span>
-                            </div>
-                        )}
-                        <iframe 
-                            className="w-full h-full bg-white transition-opacity duration-300" 
-                            srcDoc={projectFiles['index.html']} 
-                            sandbox="allow-scripts allow-forms allow-same-origin"
-                            title="Preview"
-                        />
-                       </div>
-                   </div>
-               ) : (
-                <div className="w-full h-full rounded-[12px] border-2 border-dashed border-[#6b6b6b]/20 flex items-center justify-center bg-[#f9f8f5] relative overflow-hidden stagger-fade-in">
-                    <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 15, ease: "linear" }} className="absolute -inset-40 bg-gradient-to-r from-transparent via-[#01696f]/5 to-transparent opacity-30 blur-3xl"></motion.div>
-                    <div className="text-center relative z-10 w-full max-w-sm p-8">
-                        <div className="w-24 h-24 bg-white rounded-full shadow-lg flex items-center justify-center mx-auto mb-8 border border-alpha premium-transition hover:scale-110">
-                            <Layers className="w-10 h-10 text-[#01696f]/20" />
+                {isPreviewLoading ? (
+                    <div className="w-full h-full bg-[#f9f8f5] rounded-[12px] border border-alpha overflow-hidden shadow-warm flex flex-col items-center justify-center gap-6 stagger-fade-in relative">
+                        <div className="shimmer absolute inset-0 opacity-10" />
+                        <div className="relative">
+                            <RefreshCcw className="w-12 h-12 text-[#01696f] animate-spin" />
+                            <div className="absolute -inset-4 bg-[#01696f]/5 rounded-full animate-ping" />
                         </div>
-                        <h4 className="text-[#2d2d2d] font-bold text-xl mb-4 font-display">Environment Offline</h4>
-                        <p className="text-sm text-[#6b6b6b] px-6 leading-relaxed font-medium">Provide a project mandate and instruct the architect to compile the distributed components to see the live preview here.</p>
+                        <div className="text-center">
+                            <h4 className="text-[#2d2d2d] font-bold text-lg mb-2 font-display uppercase tracking-widest">Spinning up runtime</h4>
+                            <p className="text-xs text-[#6b6b6b] font-medium tracking-wider">ALLOCATING PORT AND MOUNTING VOLUME...</p>
+                        </div>
                     </div>
-                </div>
-               )}
+                ) : previewUrl ? (
+                    <div className="w-full h-full bg-white rounded-[12px] border border-alpha overflow-hidden shadow-warm flex flex-col relative stagger-fade-in">
+                        <div className="bg-[#f9f8f5] border-b border-alpha px-6 py-3 flex items-center gap-6">
+                            <div className="flex gap-2">
+                                <button 
+                                    onClick={() => iframeRef.current?.contentWindow?.location.reload()}
+                                    className="p-1 hover:bg-[#efebe3] rounded transition-all text-[#6b6b6b]"
+                                    title="Reload"
+                                >
+                                    <RefreshCcw className="w-3.5 h-3.5" />
+                                </button>
+                                <button 
+                                    onClick={() => window.open(previewUrl)}
+                                    className="p-1 hover:bg-[#efebe3] rounded transition-all text-[#6b6b6b]"
+                                    title="Open Externally"
+                                >
+                                    <Globe className="w-3.5 h-3.5" />
+                                </button>
+                            </div>
+                            <div className="flex-1 bg-[#f7f6f2] rounded-full border border-alpha px-5 py-1.5 flex items-center gap-3">
+                                <Globe className="w-3.5 h-3.5 text-[#01696f]" />
+                                <span className="text-[11px] font-mono text-[#6b6b6b] tracking-wider uppercase opacity-60 truncate">{previewUrl}</span>
+                            </div>
+                            <div className="flex items-center gap-2 px-3 py-1 bg-[#27c93f]/5 text-[#27c93f] rounded-full border border-[#27c93f]/10">
+                                <div className="w-1.5 h-1.5 rounded-full bg-[#27c93f] animate-pulse" />
+                                <span className="text-[9px] font-bold uppercase tracking-widest">Runtime Live</span>
+                            </div>
+                        </div>
+                        <div className="flex-1 bg-white relative">
+                            {isGenerating && (
+                                <div className="absolute inset-0 bg-[#f9f8f5]/80 backdrop-blur-sm z-10 flex flex-col items-center justify-center gap-4">
+                                    <RefreshCcw className="w-8 h-8 text-[#01696f] animate-spin" />
+                                    <span className="text-xs font-bold text-[#01696f] uppercase tracking-[0.2em] font-sans">Hot Reloading State Tree...</span>
+                                </div>
+                            )}
+                            <iframe 
+                                ref={iframeRef}
+                                className="w-full h-full bg-white transition-opacity duration-300" 
+                                src={previewUrl} 
+                                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                                title="Preview"
+                            />
+                        </div>
+                    </div>
+                ) : (
+                    <div className="w-full h-full rounded-[12px] border-2 border-dashed border-[#6b6b6b]/20 flex items-center justify-center bg-[#f9f8f5] relative overflow-hidden stagger-fade-in group">
+                        <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 15, ease: "linear" }} className="absolute -inset-40 bg-gradient-to-r from-transparent via-[#01696f]/5 to-transparent opacity-30 blur-3xl"></motion.div>
+                        <div className="text-center relative z-10 w-full max-w-sm p-8">
+                            <div className="w-24 h-24 bg-white rounded-full shadow-lg flex items-center justify-center mx-auto mb-8 border border-alpha premium-transition group-hover:scale-110 group-hover:rotate-12">
+                                <Play className="w-10 h-10 text-[#01696f]/40 fill-current" />
+                            </div>
+                            <h4 className="text-[#2d2d2d] font-bold text-xl mb-4 font-display">Cluster Deployment Ready</h4>
+                            <p className="text-sm text-[#6b6b6b] px-6 leading-relaxed font-medium mb-8">Generated resources are staged in the virtual container. Launch the isolated runtime to verify the build.</p>
+                            <button 
+                                onClick={startPreview}
+                                className="px-8 py-3 bg-[#01696f] text-white font-bold rounded-full shadow-xl shadow-[#01696f]/20 premium-transition hover:translate-y-[-2px] active:scale-95 flex items-center gap-3 mx-auto"
+                            >
+                                <Play className="w-4 h-4 fill-current" />
+                                Launch Preview
+                            </button>
+                        </div>
+                    </div>
+                )}
             </div>
           )}
         </div>

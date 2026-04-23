@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { exec, spawn } from "child_process";
+import * as cheerio from "cheerio";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -49,6 +50,9 @@ const getSessionDir = (sessionId: string) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 };
+
+// --- PREVIEW SYSTEM ---
+const previewProcesses = new Map<string, { process: any; port: number }>();
 
 async function startServer() {
   const app = express();
@@ -143,6 +147,48 @@ async function startServer() {
       res.json(data);
     } catch (err: any) {
       res.status(err.status || 500).json({ error: err.message, body: err.body });
+    }
+  });
+
+  app.post("/api/scrape", async (req, res) => {
+    try {
+      const { url } = req.body;
+      const response = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AI-Architect-Bot/1.0)' }
+      });
+      const html = await response.text();
+      const $ = cheerio.load(html);
+
+      const title = $('title').text();
+      const metaDescription = $('meta[name="description"]').attr('content') || '';
+      const headings = $('h1, h2, h3').map((_, el) => $(el).text().trim()).get().slice(0, 20);
+      const bodyText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 3000);
+      
+      const colors = [...new Set(html.match(/#[0-9a-fA-F]{3,6}|rgb\([^)]+\)/g) || [])].slice(0, 10);
+      const fonts = [...new Set(html.match(/font-family:[^;]+;/g) || [])].map(f => f.replace('font-family:', '').replace(';', '').trim()).slice(0, 10);
+      
+      const sections = $('section, main, article, header, footer, nav').map((_, el) => ({
+        tag: el.tagName,
+        classes: $(el).attr('class'),
+        text: $(el).children().first().text().replace(/\s+/g, ' ').trim().substring(0, 100)
+      })).get().slice(0, 15);
+
+      const imageUrls = $('img').map((_, el) => $(el).attr('src')).get().slice(0, 10);
+      const links = $('a').map((_, el) => $(el).text().trim()).get().filter(Boolean).slice(0, 20);
+
+      res.json({
+        title,
+        metaDescription,
+        headings,
+        bodyText,
+        colors,
+        fonts,
+        sections,
+        imageUrls,
+        links
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -386,6 +432,46 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // --- PREVIEW API ---
+  app.post("/api/sessions/:id/preview/start", async (req, res) => {
+    const sessionId = req.params.id;
+    if (previewProcesses.has(sessionId)) {
+      return res.json({ port: previewProcesses.get(sessionId)!.port, url: `http://localhost:${previewProcesses.get(sessionId)!.port}` });
+    }
+
+    const port = Math.floor(Math.random() * 1001) + 4000; // 4000-5000
+    const cwd = getSessionDir(sessionId);
+    
+    // Check if index.html exists, create a default one if not to avoid 'serve' error
+    if (!fs.existsSync(path.join(cwd, 'index.html'))) {
+      fs.writeFileSync(path.join(cwd, 'index.html'), '<html><body><h1>AI Architect Preview</h1><p>Generate some code to see it here.</p></body></html>');
+    }
+
+    const child = spawn('npx', ['serve', '-s', '.', '-l', port.toString()], { 
+      cwd,
+      env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/usr/bin:/bin` }
+    });
+
+    previewProcesses.set(sessionId, { process: child, port });
+
+    // Give it a moment to spin up
+    setTimeout(() => {
+      res.json({ port, url: `http://localhost:${port}` });
+    }, 1500);
+
+    child.on('exit', () => previewProcesses.delete(sessionId));
+  });
+
+  app.delete("/api/sessions/:id/preview/stop", (req, res) => {
+    const sessionId = req.params.id;
+    const processInfo = previewProcesses.get(sessionId);
+    if (processInfo) {
+      processInfo.process.kill();
+      previewProcesses.delete(sessionId);
+    }
+    res.json({ status: 'ok' });
   });
 
   // Vite middleware for development
