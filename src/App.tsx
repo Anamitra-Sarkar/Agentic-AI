@@ -11,12 +11,28 @@ import {
     Send, Play, Code2, Layout as LayoutIcon, RefreshCcw, 
     Box, FileCode, ChevronRight, CheckCircle2, Server, Globe, Layers, Sparkles,
     X, Settings, MoreVertical, Trash2, Copy, Edit, AlertCircle, Info, Check,
-    Bot, User, List, SkipForward, ShieldCheck, Terminal as TerminalIcon
+    Bot, User, List, SkipForward, ShieldCheck, Terminal as TerminalIcon, WifiOff, LogOut, LoaderCircle
 } from 'lucide-react';
+import { auth, signInWithGoogle, signInWithGithub, logout, onAuthStateChanged, type User as FirebaseUser } from './firebase';
 
 type View = 'landing' | 'building';
-type AppStatus = 'idle' | 'rectifying' | 'prompt-review' | 'building';
+type AppStatus = 'idle' | 'clarifying' | 'rectifying' | 'prompt-review' | 'building';
 type Tab = 'workspace' | 'codebase' | 'preview';
+
+type ClarificationQuestion = {
+  id: string;
+  question: string;
+  type: 'yesno' | 'choice' | 'text';
+  options?: string[];
+  answer: string | null;
+};
+
+type QueuedInstruction = {
+  id: string;
+  instruction: string;
+  queuedAt: number;
+  status: 'queued' | 'processing' | 'done' | 'failed';
+};
 
 interface Session {
   id: string;
@@ -53,6 +69,13 @@ interface ChatMessage {
   content: string;
 }
 
+interface CheckpointState {
+  phase: string;
+  files: Record<string, string>;
+  chatHistory: ChatMessage[];
+  updated_at: number;
+}
+
 const cleanCode = (text: string) => {
     // 1. Aggressively extract the first code block if it exists (standard Markdown)
     const codeBlockMatch = text.match(/```(?:[\w\-]*)\n([\s\S]*?)```/);
@@ -84,6 +107,7 @@ const cleanCode = (text: string) => {
 const TaskRouter = {
     // GROQ (Verified Routing Matrix)
     rectification: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
+    clarifier: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
     compression: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
     toolController: { provider: 'groq', model: 'llama-3.3-70b-versatile' },
     
@@ -119,15 +143,49 @@ const groqTools = [
     { type: "function", function: { name: "get_preview_url", description: "Returns the proxied URL for the running app on the HF container.", parameters: { type: "object", properties: {}, required: [] } } }
 ];
 
+const waitForOnline = () => new Promise<void>((resolve) => {
+  if (navigator.onLine) return resolve();
+  const handleOnline = () => {
+    window.removeEventListener('online', handleOnline);
+    resolve();
+  };
+  window.addEventListener('online', handleOnline);
+});
+
+const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 4): Promise<Response> => {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (!navigator.onLine) await waitForOnline();
+      const res = await fetch(url, { ...options, signal: AbortSignal.timeout(60000) });
+      if (res.status === 503 || res.status === 429) throw new Error(`HTTP${res.status}`);
+      return res;
+    } catch (err: any) {
+      if (attempt === maxRetries) throw err;
+      const delay = Math.min(1000 * 2 ** attempt, 16000);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error('Max retries exceeded');
+};
+
 export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [view, setView] = useState<View>('landing');
   const [status, setStatus] = useState<AppStatus>('idle');
   const [prompt, setPrompt] = useState<string>('');
   const [rectifiedPrompt, setRectifiedPrompt] = useState<string>('');
+  const [clarifications, setClarifications] = useState<ClarificationQuestion[]>([]);
+  const [isClarifying, setIsClarifying] = useState(false);
   
   const [followUp, setFollowUp] = useState<string>('');
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [compressedContext, setCompressedContext] = useState<string>('');
+
+  // Instruction Queue (persistent in-memory queue)
+  const [instructionQueue, setInstructionQueue] = useState<QueuedInstruction[]>([]);
+  const [queueInput, setQueueInput] = useState('');
+  const isProcessingQueue = useRef(false);
   
   const [cloneUrl, setCloneUrl] = useState('');
   const [isUrlMode, setIsUrlMode] = useState(false);
@@ -137,6 +195,10 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('workspace');
   const [projectFiles, setProjectFiles] = useState<Record<string, string>>({});
   const filesSnapshotRef = useRef<Record<string, string>>({});
+  const [resumeCheckpoint, setResumeCheckpoint] = useState<CheckpointState | null>(null);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isGenerationQueued, setIsGenerationQueued] = useState(false);
+  const chatHistoryRef = useRef<ChatMessage[]>([]);
   
   const updateProjectFiles = (newFiles: Record<string, string>) => {
     filesSnapshotRef.current = newFiles;
@@ -156,7 +218,10 @@ export default function App() {
     if (!activeSession) return showToast('Save a session first', 'warning');
     setIsPreviewLoading(true);
     try {
-      const res = await fetch(`/api/sessions/${activeSession.id}/preview/start`, { method: 'POST' });
+      const res = await fetchWithRetry(`/api/sessions/${activeSession.id}/preview/start`, {
+        method: 'POST',
+        headers: sessionHeaders(),
+      });
       const { url } = await res.json();
       setPreviewUrl(url);
     } catch (e) {
@@ -266,6 +331,10 @@ export default function App() {
   }, [terminalEntries]);
 
   useEffect(() => {
+    chatHistoryRef.current = chatHistory;
+  }, [chatHistory]);
+
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setModal(null);
@@ -278,14 +347,103 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchSessions();
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+      if (!u) {
+        setSessions([]);
+        setActiveSession(null);
+        setResumeCheckpoint(null);
+      }
+    });
   }, []);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      setIsGenerationQueued(false);
+      showToast('Connection restored', 'success');
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      if (isGenerating) setIsGenerationQueued(true);
+      showToast("You're offline — generation continues on cloud", 'warning');
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [isGenerating]);
+
+  useEffect(() => {
+    if (isGenerating && !isOnline) setIsGenerationQueued(true);
+    if (isOnline && !isGenerating) setIsGenerationQueued(false);
+  }, [isGenerating, isOnline]);
+
+  useEffect(() => {
+    if (!user) return;
+    fetchSessions();
+  }, [user]);
+
+  useEffect(() => {
+    if (!activeSession || !user) return;
+    loadCheckpoint(activeSession.id);
+  }, [activeSession, user]);
+
+  const sessionHeaders = (extra: HeadersInit = {}) => ({
+    'Content-Type': 'application/json',
+    'X-User-Id': user?.uid || '',
+    ...extra,
+  });
+
+  const loadCheckpoint = async (sessionId: string) => {
+    try {
+      const res = await fetchWithRetry(`/api/sessions/${sessionId}/checkpoint`, {
+        method: 'GET',
+        headers: sessionHeaders(),
+      });
+      if (!res.ok) {
+        setResumeCheckpoint(null);
+        return;
+      }
+      const data = await res.json();
+      setResumeCheckpoint({
+        phase: data.phase,
+        files: JSON.parse(data.files || '{}'),
+        chatHistory: JSON.parse(data.chat_history || '[]'),
+        updated_at: data.updated_at,
+      });
+    } catch {
+      setResumeCheckpoint(null);
+    }
+  };
+
+  const saveCheckpoint = async (sessionId: string, phase: string, files: Record<string, string>, history: ChatMessage[]) => {
+    await fetchWithRetry(`/api/sessions/${sessionId}/checkpoint`, {
+      method: 'POST',
+      headers: sessionHeaders(),
+      body: JSON.stringify({ phase, files, chatHistory: history }),
+    });
+  };
 
   const fetchSessions = async () => {
     try {
-      const res = await fetch('/api/sessions');
+      const res = await fetchWithRetry('/api/sessions', {
+        method: 'GET',
+        headers: sessionHeaders(),
+      });
       const data = await res.json();
       setSessions(data);
+      const savedSessionId = localStorage.getItem('ai-architect-last-session-id');
+      if (savedSessionId) {
+        const savedSession = data.find((s: Session) => s.id === savedSessionId);
+        if (savedSession) {
+          setActiveSession(savedSession);
+          loadCheckpoint(savedSessionId);
+        }
+      }
     } catch (e) {
       showToast('Offline: Could not sync sessions', 'error');
     }
@@ -293,13 +451,14 @@ export default function App() {
 
   const createSession = async (name: string = "New Project") => {
     try {
-      const res = await fetch('/api/sessions', {
+      const res = await fetchWithRetry('/api/sessions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, modelConfig: TaskRouter })
+        headers: sessionHeaders(),
+        body: JSON.stringify({ name, modelConfig: TaskRouter, userId: user?.uid }),
       });
       const newSession = await res.json();
       setSessions(prev => [newSession, ...prev]);
+      localStorage.setItem('ai-architect-last-session-id', newSession.id);
       return newSession;
     } catch (e) {
       showToast('Failed to create session', 'error');
@@ -308,6 +467,7 @@ export default function App() {
 
   const loadSession = async (session: Session) => {
     setActiveSession(session);
+    localStorage.setItem('ai-architect-last-session-id', session.id);
     setPrompt(session.name);
     setRectifiedPrompt(session.name);
     setView('building');
@@ -315,8 +475,8 @@ export default function App() {
     
     try {
       const [filesRes, historyRes] = await Promise.all([
-        fetch(`/api/sessions/${session.id}/files`),
-        fetch(`/api/sessions/${session.id}/terminal-history`)
+        fetchWithRetry(`/api/sessions/${session.id}/files`, { method: 'GET', headers: sessionHeaders() }),
+        fetchWithRetry(`/api/sessions/${session.id}/terminal-history`, { method: 'GET', headers: sessionHeaders() })
       ]);
       const filesArr = await filesRes.json();
       const history = await historyRes.json();
@@ -333,6 +493,7 @@ export default function App() {
         status: 'success',
         timestamp: h.timestamp
       })));
+      loadCheckpoint(session.id);
       showToast(`Restored: ${session.name}`, 'success');
     } catch (e) {
       showToast('Data recovery partially failed', 'warning');
@@ -342,9 +503,9 @@ export default function App() {
   const renameSession = async () => {
     if (!activeSession || !sessionNameInput.trim()) return;
     try {
-      await fetch(`/api/sessions/${activeSession.id}`, {
+      await fetchWithRetry(`/api/sessions/${activeSession.id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: sessionHeaders(),
         body: JSON.stringify({ name: sessionNameInput })
       });
       setActiveSession({ ...activeSession, name: sessionNameInput });
@@ -361,20 +522,20 @@ export default function App() {
     setIsAutoSaving(true);
     try {
       // Find file ID if exists
-      const filesRes = await fetch(`/api/sessions/${activeSession.id}/files`);
+      const filesRes = await fetchWithRetry(`/api/sessions/${activeSession.id}/files`, { method: 'GET', headers: sessionHeaders() });
       const filesArr = await filesRes.json();
       const existing = filesArr.find((f: any) => f.path === filename);
       
       if (existing) {
-        await fetch(`/api/sessions/${activeSession.id}/files/${existing.id}`, {
+        await fetchWithRetry(`/api/sessions/${activeSession.id}/files/${existing.id}`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: sessionHeaders(),
           body: JSON.stringify({ content })
         });
       } else {
-        await fetch(`/api/sessions/${activeSession.id}/files`, {
+        await fetchWithRetry(`/api/sessions/${activeSession.id}/files`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: sessionHeaders(),
           body: JSON.stringify({ path: filename, content, language: 'typescript' })
         });
       }
@@ -418,9 +579,9 @@ export default function App() {
     setTerminalEntries(prev => [...prev, newEntry]);
 
     try {
-      const response = await fetch('/api/terminal/execute-stream', {
+      const response = await fetchWithRetry('/api/terminal/execute-stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: sessionHeaders(),
         body: JSON.stringify({ command, sessionId: activeSession?.id })
       });
 
@@ -455,9 +616,9 @@ export default function App() {
                 if (source === 'ai') {
                     const firstFile = Object.keys(filesSnapshotRef.current).find(f => f.endsWith('.ts') || f.endsWith('.tsx') || f.endsWith('.py'));
                     if (firstFile) {
-                        const verifyRes = await fetch('/api/terminal/verify', {
+                        const verifyRes = await fetchWithRetry('/api/terminal/verify', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: sessionHeaders(),
                             body: JSON.stringify({ sessionId: activeSession?.id, filePath: firstFile })
                         });
                         const vData = await verifyRes.json();
@@ -471,9 +632,9 @@ export default function App() {
                 }
 
                 if (activeSession) {
-                  fetch(`/api/sessions/${activeSession.id}/terminal-history`, {
+                  fetchWithRetry(`/api/sessions/${activeSession.id}/terminal-history`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: sessionHeaders(),
                     body: JSON.stringify({ command: source === 'user' ? `$ ${command}` : command, output: fullOutput })
                   });
                 }
@@ -519,14 +680,14 @@ export default function App() {
             body.tool_choice = 'auto';
         }
 
-        const res = await fetch(url, {
+        const res = await fetchWithRetry(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
         
         if (!res.ok) {
-            if (res.status === 429 || res.status === 503) throw new Error(`HTTP_${res.status}`);
+            if (res.status === 429 || res.status === 503) throw new Error(`HTTP${res.status}`);
             const errorData = await res.json().catch(() => ({}));
             throw new Error(errorData.error || `${res.status} ${res.statusText}`);
         }
@@ -537,9 +698,9 @@ export default function App() {
         const data = await attemptFetch(task.provider, task.model);
         return data.choices?.[0]?.message;
     } catch (err: any) {
-        if (err.message.includes('HTTP_429') || err.message.includes('HTTP_503') || err.message.includes('timeout')) {
+        if (err.message.includes('HTTP429') || err.message.includes('HTTP503') || err.message.includes('timeout')) {
             if ('fallback' in task && task.fallback) {
-                if (logger) logger(`${task.provider === 'openrouter' ? 'OpenRouter' : 'NVIDIA'} ${err.message.replace('HTTP_', '')} -> Fallback: Groq ${task.fallback.model}`, 'warning');
+                if (logger) logger(`${task.provider === 'openrouter' ? 'OpenRouter' : 'NVIDIA'} ${err.message.replace('HTTP', '')} -> Fallback: Groq ${task.fallback.model}`, 'warning');
                 try {
                     const fallbackData = await attemptFetch(task.fallback.provider, task.fallback.model);
                     return fallbackData.choices?.[0]?.message;
@@ -559,7 +720,7 @@ export default function App() {
 
       if (name === 'tavily_dependency_check') {
           try {
-              const res = await fetch('/api/proxy/tavily', {
+              const res = await fetchWithRetry('/api/proxy/tavily', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ query: `latest stable version and breaking changes of ${args.package_name} for ${args.framework}` })
@@ -588,7 +749,7 @@ export default function App() {
           log(`Syncing ${Object.keys(args.files).length} files to Virtual File System...`, 'tool');
           updateProjectFiles(args.files); // PERSIST RE-GENERATED CODEBASE TO FRONTEND STATE
           try {
-              const res = await fetch('/api/v1/write', {
+              const res = await fetchWithRetry('/api/v1/write', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ files: args.files, sessionId: activeSession?.id })
@@ -633,7 +794,7 @@ export default function App() {
     setCloneProgress(1);
 
     try {
-      const res = await fetch('/api/scrape', {
+      const res = await fetchWithRetry('/api/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: cloneUrl })
@@ -695,27 +856,119 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     }
   }
 
-  const rectifyPrompt = async (input: string) => {
+  const askClarifications = async (input: string) => {
+    setStatus('clarifying');
+    setIsClarifying(true);
+
+    const systemPrompt = `You are the Pre-Flight Clarification Agent for an AI full-stack code generator.
+Your job: analyze the user's project prompt and generate 1 to 3 SHORT clarifying questions that would significantly change the architecture or implementation.
+
+RULES:
+- Maximum 3 questions. Minimum 1. Only ask if genuinely ambiguous.
+- If the prompt is already detailed and unambiguous, return { "questions": [] } and we skip clarification entirely.
+- Each question must be actionable — the answer must change what code gets written.
+- Prefer yes/no or multiple-choice over open text.
+- Do NOT ask about deployment, hosting, or timeline.
+- Do NOT ask obvious things ("Should it look good?" — never ask this).
+- Question types: "yesno", "choice" (provide 2-4 options), "text" (for short answers only when necessary).
+
+GOOD questions:
+- "Should users be able to create accounts and log in?" (yesno)
+- "What's the primary data store?" (choice: ["SQLite", "PostgreSQL", "MongoDB", "None — in-memory only"])
+- "Should the app have a REST API or just a frontend?" (choice: ["REST API + Frontend", "Frontend only", "API only"])
+
+BAD questions:
+- "What color scheme do you prefer?" (not architectural)
+- "Should it be fast?" (obviously yes)
+- "What framework?" (your stack is fixed: React + FastAPI)
+
+Return ONLY valid JSON in this exact shape:
+{
+  "questions": [
+    { "id": "q1", "question": "...", "type": "yesno" | "choice" | "text", "options": ["...", "..."] }
+  ]
+}`;
+
+    try {
+      const response = await callAPI(
+        TaskRouter.clarifier,
+        systemPrompt,
+        `User's project prompt: "${input}"`,
+        false
+      );
+
+      const raw = response?.content || '';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No JSON returned');
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      const questions: ClarificationQuestion[] = (parsed.questions || []).map((q: any) => ({
+        ...q,
+        answer: null
+      }));
+
+      if (questions.length === 0) {
+        setIsClarifying(false);
+        setStatus('idle');
+        rectifyPrompt(input);
+        return;
+      }
+
+      setClarifications(questions);
+      setIsClarifying(false);
+    } catch (e) {
+      setIsClarifying(false);
+      setStatus('idle');
+      rectifyPrompt(input);
+    }
+  };
+
+  const rectifyPrompt = async (input: string, clarificationContext?: string) => {
     setStatus('rectifying');
     setPrompt(input);
+    const fullInput = clarificationContext
+      ? `${input}\n\nUSER CLARIFICATIONS:\n${clarificationContext}`
+      : input;
     const content = (await callAPI(TaskRouter.rectification, 
         'You are the Senior Engineer Rectification Agent. Your goal is to translate an abstract user "vibe" into a strict technical specification. If a user asks for a vibe like "poppy", inject specific architectural requirements for spring animations (motion/react), bold shadow-xl utility classes, and high-contrast emerald/indigo color palettes without seeking clarification.', 
-        input
+        fullInput
     ))?.content;
     setRectifiedPrompt(content || '');
     setStatus('prompt-review');
     showToast('Plan Rectified & Verified', 'success');
   };
 
-  const handleApproveAndBuild = async () => {
+  const submitClarifications = () => {
+    const unanswered = clarifications.filter(q => q.answer === null);
+    if (unanswered.length > 0) {
+      showToast('Please answer all questions before proceeding', 'warning');
+      return;
+    }
+    const context = clarifications.map(q => `Q: ${q.question}\nA: ${q.answer}`).join('\n\n');
+    setClarifications([]);
+    rectifyPrompt(prompt, context);
+  };
+
+  const phaseIndex = (phase: string) => {
+    const match = phase.match(/phase-(\d+)/i);
+    return match ? Number(match[1]) : 1;
+  };
+
+  const handleApproveAndBuild = async (startPhase: number = 1, restoredFiles: Record<string, string> = {}, restoredHistory: ChatMessage[] = []) => {
     setView('building');
     setStatus('building');
     setActiveTab('workspace');
     setIsGenerating(true);
-    setTerminalEntries([]);
+    setIsGenerationQueued(false);
+    if (startPhase === 1) setTerminalEntries([]);
     setActiveAgents({});
+    if (startPhase > 1) {
+      updateProjectFiles(restoredFiles);
+      setChatHistory(restoredHistory);
+    }
     
     const logger = (msg: string, role: ChatMessage['role'] = 'system') => setChatHistory(prev => [...prev, { role, content: msg }]);
+    logger(`RECTIFIED SPEC: ${rectifiedPrompt}`, 'system');
     
     // Detect Clone Mode
     const isClone = rectifiedPrompt.trim().startsWith('CLONE TARGET:');
@@ -723,73 +976,81 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     const additionalInstruction = isClone ? "\nThis is a pixel-accurate clone task. Match the visual design, colors, layout structure, and content hierarchy as closely as possible. Do NOT add generic placeholder content." : "";
 
     // PHASE 1: PLAN (Manifest Generation & SOUL.md Integration)
-    logger('PHASE 1: Extracting Project Soul...');
-    setActiveAgents({ 'Architect': TaskRouter.rectification.model });
-    
     const projectSoul = `# SOUL.md - Project Integrity State\n\n## Tech Stack\n- Backend: ${isClone ? 'Python 3.10 (FastAPI)' : 'Python 3.10 (FastAPI)'}\n- Frontend: React 19 + Tailwind CSS\n- UI Style: ${isClone ? 'Identical Clone' : 'Frosted Neon'}\n\n## Design System (The Vibe)\n- Spec: ${rectifiedPrompt.substring(0, 500)}\n\n## Verification Status\n- Build Status: Awaiting Pulse Check\n`;
-    let currentFiles: Record<string, string> = { 'SOUL.md': projectSoul };
+    let currentFiles: Record<string, string> = startPhase > 1 ? { ...restoredFiles } : { 'SOUL.md': projectSoul };
 
-    // 1. Tool Controller Phase
-    setActiveAgents(prev => ({ ...prev, 'Controller': TaskRouter.toolController.model }));
-    const controllerMsg = await callAPI(TaskRouter.toolController, 
-        'Identify environment dependencies. Consult SOUL.md if present.', 
-        `Rectified Spec: ${rectifiedPrompt}\nContext: ${projectSoul}`, 
-        true, 
-        logger
-    );
+    if (startPhase <= 1) {
+      logger('PHASE 1: Extracting Project Soul...');
+      setActiveAgents({ 'Architect': TaskRouter.rectification.model });
+      
+      // 1. Tool Controller Phase
+      setActiveAgents(prev => ({ ...prev, 'Controller': TaskRouter.toolController.model }));
+      const controllerMsg = await callAPI(TaskRouter.toolController, 
+          'Identify environment dependencies. Consult SOUL.md if present.', 
+          `Rectified Spec: ${rectifiedPrompt}\nContext: ${projectSoul}`, 
+          true, 
+          logger
+      );
 
-    if (controllerMsg?.tool_calls) {
-        logger(`Agentic Swarm triggered autonomous env checks...`, 'tool');
-        for (const call of controllerMsg.tool_calls) {
-             const result = await executeToolCall(call, logger);
-             if (call.function.name === 'huggingface_space_init') currentFiles['README.md'] = result;
-             if (call.function.name === 'vercel_json_scaffold') currentFiles['vercel.json'] = result;
-        }
+      if (controllerMsg?.tool_calls) {
+          logger(`Agentic Swarm triggered autonomous env checks...`, 'tool');
+          for (const call of controllerMsg.tool_calls) {
+               const result = await executeToolCall(call, logger);
+               if (call.function.name === 'huggingface_space_init') currentFiles['README.md'] = result;
+               if (call.function.name === 'vercel_json_scaffold') currentFiles['vercel.json'] = result;
+          }
+      }
+
+      // PHASE 1: DRAFT (Surgical Logic via Scout)
+      logger(`PHASE 1: "The Draft" - Synthesizing full stack ${isClone ? 'clone' : 'logic'}...`, 'system');
+      setActiveAgents({ 'Drafting': taskConfig.model });
+      
+      const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
+          callAPI(taskConfig, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskConfig, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskConfig, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskConfig, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskConfig, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
+      ]);
+
+      const initialFiles = {
+          ...currentFiles,
+          'backend/main.py': cleanCode(backendRes?.content || ''),
+          'frontend/src/App.tsx': cleanCode(frontendRes?.content || ''),
+          'frontend/src/index.css': `@import "tailwindcss";\n@layer utilities {\n${cleanCode(cssRes?.content || '')}\n}`,
+          'backend/requirements.txt': cleanCode(reqsRes?.content || 'fastapi\nuvicorn'),
+          'Dockerfile': cleanCode(dockerRes?.content || 'FROM python:3.10\nWORKDIR /app\nCOPY . .\nRUN pip install -r backend/requirements.txt\nCMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]')
+      };
+      updateProjectFiles(initialFiles);
+      currentFiles = initialFiles;
+      if (activeSession) await saveCheckpoint(activeSession.id, 'phase-1', currentFiles, chatHistoryRef.current);
     }
 
-    // PHASE 1: DRAFT (Surgical Logic via Scout)
-    logger(`PHASE 1: "The Draft" - Synthesizing full stack ${isClone ? 'clone' : 'logic'}...`, 'system');
-    setActiveAgents({ 'Drafting': taskConfig.model });
-    
-    const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
-        callAPI(taskConfig, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
-        callAPI(taskConfig, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
-        callAPI(taskConfig, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
-        callAPI(taskConfig, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
-        callAPI(taskConfig, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
-    ]);
-
-    const initialFiles = {
-        ...currentFiles,
-        'backend/main.py': cleanCode(backendRes?.content || ''),
-        'frontend/src/App.tsx': cleanCode(frontendRes?.content || ''),
-        'frontend/src/index.css': `@import "tailwindcss";\n@layer utilities {\n${cleanCode(cssRes?.content || '')}\n}`,
-        'backend/requirements.txt': cleanCode(reqsRes?.content || 'fastapi\nuvicorn'),
-        'Dockerfile': cleanCode(dockerRes?.content || 'FROM python:3.10\nWORKDIR /app\nCOPY . .\nRUN pip install -r backend/requirements.txt\nCMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]')
-    };
-    updateProjectFiles(initialFiles);
-
     // PHASE 2: AUDIT (Heavyweight Integrity Check via GPT-OSS)
-    logger('PHASE 2: "The Audit" - Scrubbing documentation drift from source...', 'system');
-    setActiveAgents({ 'Audit': TaskRouter.audit.model });
-    
-    const auditStatus = await callAPI(TaskRouter.audit,
-        `You are the Code Auditor. Remove any prose, markdown headers, or non-executable text from the following files.
-        Return ONLY a JSON map of filename to pure code content. Use absolute paths as keys.`,
-        JSON.stringify(filesSnapshotRef.current),
-        false,
-        logger
-    );
+    if (startPhase <= 2) {
+      logger('PHASE 2: "The Audit" - Scrubbing documentation drift from source...', 'system');
+      setActiveAgents({ 'Audit': TaskRouter.audit.model });
+      
+      const auditStatus = await callAPI(TaskRouter.audit,
+          `You are the Code Auditor. Remove any prose, markdown headers, or non-executable text from the following files.
+          Return ONLY a JSON map of filename to pure code content. Use absolute paths as keys.`,
+          JSON.stringify(filesSnapshotRef.current),
+          false,
+          logger
+      );
 
-    if (auditStatus?.content && !auditStatus.content.toLowerCase().includes('approved')) {
-        try {
-            const auditedFiles = JSON.parse(cleanCode(auditStatus?.content || '{}'));
-            const purgedFiles = { ...filesSnapshotRef.current, ...auditedFiles };
-            updateProjectFiles(purgedFiles);
-            logger('✓ AUDIT COMPLETE: Source code sanitized.', 'ai');
-        } catch (e) {
-            logger('Audit refinement failed. Continuing to verification.', 'warning');
-        }
+      if (auditStatus?.content && !auditStatus.content.toLowerCase().includes('approved')) {
+          try {
+              const auditedFiles = JSON.parse(cleanCode(auditStatus?.content || '{}'));
+              const purgedFiles = { ...filesSnapshotRef.current, ...auditedFiles };
+              updateProjectFiles(purgedFiles);
+              logger('✓ AUDIT COMPLETE: Source code sanitized.', 'ai');
+              currentFiles = purgedFiles;
+          } catch (e) {
+              logger('Audit refinement failed. Continuing to verification.', 'warning');
+          }
+      }
+      if (activeSession) await saveCheckpoint(activeSession.id, 'phase-2', filesSnapshotRef.current, chatHistoryRef.current);
     }
 
     const agenticTerminalRun = async (primary: string, fallbacks: string[], workdir: string = '/') => {
@@ -809,64 +1070,70 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     };
 
     // PHASE 3 & 4: RAPID PATCH & AGENTIC VERIFICATION
-    logger('PHASE 3: "The Rapid Patch" - Initiating Agentic Verification...', 'system');
-    setIsVerifying(true);
-    setActiveAgents({ 'Patching': TaskRouter.rapidPatch.model });
-    
-    let buildAttempts = 0;
     let buildSuccess = false;
-    while (buildAttempts < 3) {
-        buildAttempts++;
-        logger(`Verification Cycle ${buildAttempts}/3...`, 'system');
-        
-        await executeToolCall({ function: { name: 'fs_sync', arguments: JSON.stringify({ files: filesSnapshotRef.current }) } }, logger);
+    if (startPhase <= 3) {
+      logger('PHASE 3: "The Rapid Patch" - Initiating Agentic Verification...', 'system');
+      setIsVerifying(true);
+      setActiveAgents({ 'Patching': TaskRouter.rapidPatch.model });
+      
+      let buildAttempts = 0;
+      while (buildAttempts < 3) {
+          buildAttempts++;
+          logger(`Verification Cycle ${buildAttempts}/3...`, 'system');
+          
+          await executeToolCall({ function: { name: 'fs_sync', arguments: JSON.stringify({ files: filesSnapshotRef.current }) } }, logger);
 
-        // AGENTIC INSTALL & CHECK
-        const pipStatus = await agenticTerminalRun(
-            'python3 -m pip install -r backend/requirements.txt',
-            ['pip3 install -r backend/requirements.txt', 'pip install -r backend/requirements.txt']
-        );
+          // AGENTIC INSTALL & CHECK
+          await agenticTerminalRun(
+              'python3 -m pip install -r backend/requirements.txt',
+              ['pip3 install -r backend/requirements.txt', 'pip install -r backend/requirements.txt']
+          );
 
-        const backendStatus = await agenticTerminalRun(
-            'python3 -m py_compile backend/main.py',
-            ['python -m py_compile backend/main.py']
-        );
+          const backendStatus = await agenticTerminalRun(
+              'python3 -m py_compile backend/main.py',
+              ['python -m py_compile backend/main.py']
+          );
 
-        const frontendStatus = await agenticTerminalRun(
-            'npx -y esbuild frontend/src/App.tsx --bundle --dry-run', 
-            ['node --check frontend/src/App.tsx', 'ls frontend/src/App.tsx']
-        );
+          const frontendStatus = await agenticTerminalRun(
+              'npx -y esbuild frontend/src/App.tsx --bundle --dry-run', 
+              ['node --check frontend/src/App.tsx', 'ls frontend/src/App.tsx']
+          );
 
-        if (backendStatus.exit_code === 0 && frontendStatus.exit_code === 0) {
-            buildSuccess = true;
-            logger('✓ VERIFICATION SUCCESSFUL: Full Stack Integrity Confirmed.', 'ai');
-            showToast('Build Integrity Verified', 'success');
-            break;
-        }
+          if (backendStatus.exit_code === 0 && frontendStatus.exit_code === 0) {
+              buildSuccess = true;
+              logger('✓ VERIFICATION SUCCESSFUL: Full Stack Integrity Confirmed.', 'ai');
+              showToast('Build Integrity Verified', 'success');
+              break;
+          }
 
-        // SELF-HEALING
-        const errorLog = backendStatus.exit_code !== 0 ? backendStatus.stderr : frontendStatus.stderr;
-        logger(`!! DEPLOYMENT ERROR: Triggering rapid healing for ${backendStatus.exit_code === 0 ? 'frontend' : 'backend'}...`, 'warning');
-        showToast('Build Conflict Detected', 'warning');
-        
-        const healingPatch = await callAPI(TaskRouter.rapidPatch,
-            `Build failed. ERROR: ${errorLog}. Fix using PURE CODE ONLY via apply_unified_diff format.`,
-            JSON.stringify(filesSnapshotRef.current),
-            true,
-            logger
-        );
+          // SELF-HEALING
+          const errorLog = backendStatus.exit_code !== 0 ? backendStatus.stderr : frontendStatus.stderr;
+          logger(`!! DEPLOYMENT ERROR: Triggering rapid healing for ${backendStatus.exit_code === 0 ? 'frontend' : 'backend'}...`, 'warning');
+          showToast('Build Conflict Detected', 'warning');
+          
+          const healingPatch = await callAPI(TaskRouter.rapidPatch,
+              `Build failed. ERROR: ${errorLog}. Fix using PURE CODE ONLY via apply_unified_diff format.`,
+              JSON.stringify(filesSnapshotRef.current),
+              true,
+              logger
+          );
 
-        if (healingPatch?.tool_calls) {
-            for (const call of healingPatch.tool_calls) {
-                if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
-            }
-        }
+          if (healingPatch?.tool_calls) {
+              for (const call of healingPatch.tool_calls) {
+                  if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
+              }
+          }
+      }
+      if (activeSession) await saveCheckpoint(activeSession.id, 'phase-3', filesSnapshotRef.current, chatHistoryRef.current);
     }
 
     // Final SOUL sync
-    const finalFiles = { ...filesSnapshotRef.current };
-    finalFiles['SOUL.md'] = (finalFiles['SOUL.md'] || '') + `\n## Final Audit\n- Verified: ${buildSuccess ? 'SUCCESS' : 'FAILURE'}\n- Iterations: ${buildAttempts}\n- Time: ${new Date().toISOString()}\n`;
-    updateProjectFiles(finalFiles);
+    if (startPhase <= 4) {
+      const finalFiles = { ...filesSnapshotRef.current };
+      finalFiles['SOUL.md'] = (finalFiles['SOUL.md'] || '') + `\n## Final Audit\n- Verified: ${buildSuccess ? 'SUCCESS' : 'FAILURE'}\n- Iterations: ${3}\n- Time: ${new Date().toISOString()}\n`;
+      updateProjectFiles(finalFiles);
+      if (activeSession) await saveCheckpoint(activeSession.id, 'phase-4', finalFiles, chatHistoryRef.current);
+    }
 
     setIsVerifying(false);
     setIsGenerating(false);
@@ -875,13 +1142,57 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     showToast(buildSuccess ? 'Cluster Stabilized' : 'Build Compromised', buildSuccess ? 'success' : 'error');
   };
 
-  const sendFollowUp = async () => {
-    if (!followUp.trim() || isGenerating) return;
-    
-    const userMsg = followUp;
-    setFollowUp('');
+  const resumeBuildFromCheckpoint = async () => {
+    if (!activeSession || !resumeCheckpoint) return;
+    const nextPhase = phaseIndex(resumeCheckpoint.phase) + 1;
+    const restoredPrompt = resumeCheckpoint.chatHistory.find(msg => msg.content.startsWith('RECTIFIED SPEC:'))?.content.replace('RECTIFIED SPEC: ', '') || rectifiedPrompt;
+    setPrompt(restoredPrompt);
+    setRectifiedPrompt(restoredPrompt);
+    setResumeCheckpoint(null);
+    await handleApproveAndBuild(nextPhase, resumeCheckpoint.files, resumeCheckpoint.chatHistory);
+  };
+
+  const statusOverlays = (
+    <>
+      <AnimatePresence>
+        {!isOnline && (
+          <motion.div
+            initial={{ y: -40, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: -40, opacity: 0 }}
+            className="fixed top-0 left-0 w-full z-50 bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-3 text-amber-800 text-sm font-bold"
+          >
+            <WifiOff className="w-4 h-4" />
+            Offline — LLMs are still working on the cloud. Results will sync on reconnect.
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {resumeCheckpoint && activeSession && (
+          <motion.div
+            initial={{ y: -20, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: -20, opacity: 0 }}
+            className="fixed top-14 left-1/2 -translate-x-1/2 z-40 bg-[#f9f8f5] border border-alpha shadow-warm rounded-full px-5 py-3 flex items-center gap-4 text-sm font-bold text-[#2d2d2d]"
+          >
+            <span>Resume incomplete build?</span>
+            <button onClick={resumeBuildFromCheckpoint} className="px-4 py-1.5 rounded-full bg-[#01696f] text-white text-xs uppercase tracking-widest">
+              Resume
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
+  );
+
+  // Core direct send logic extracted so it can be called by the queue processor.
+  const sendFollowUpDirect = async (instruction: string) => {
+    if (!instruction.trim()) return;
+
+    const userMsg = instruction;
+    // Mirror previous behavior: add user message to chat (caller clears followUp)
     setChatHistory(prev => [...prev, { role: 'user', content: userMsg }]);
-    
+
     setIsGenerating(true);
     const logger = (msg: string, role: ChatMessage['role'] = 'system') => setChatHistory(prev => [...prev, { role, content: msg }]);
     const entryFiles = { ...filesSnapshotRef.current };
@@ -950,7 +1261,7 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                 logger
             );
             if (heal?.tool_calls) {
-                for (const call of heal.tool_calls) {
+                for (const call of heal?.tool_calls) {
                     if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
                 }
             }
@@ -971,6 +1282,76 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     }
   };
 
+  // Queue helpers
+  const addToQueue = (instruction: string) => {
+    if (!instruction || !instruction.trim()) return;
+    const item: QueuedInstruction = {
+      id: Math.random().toString(36).substring(2, 9),
+      instruction: instruction.trim(),
+      queuedAt: Date.now(),
+      status: 'queued'
+    };
+    setInstructionQueue(prev => [...prev, item]);
+    setQueueInput('');
+    showToast('Instruction queued', 'info');
+    // If agent is free, start processing immediately
+    if (!isGenerating && !isProcessingQueue.current) {
+      processQueue();
+    }
+  };
+
+  const processQueue = async () => {
+    if (isProcessingQueue.current) return;
+    isProcessingQueue.current = true;
+
+    while (true) {
+      // Get next queued item
+      let nextItem: QueuedInstruction | null = null;
+      setInstructionQueue(prev => {
+        const idx = prev.findIndex(i => i.status === 'queued');
+        if (idx === -1) return prev;
+        nextItem = prev[idx];
+        return prev.map((i, ii) => ii === idx ? { ...i, status: 'processing' } : i);
+      });
+
+      // Small delay to let state settle
+      await new Promise(r => setTimeout(r, 50));
+
+      if (!nextItem) break; // Queue empty
+
+      try {
+        // Set the follow-up input (visible) and trigger sendFollowUpDirect
+        setFollowUp((nextItem as QueuedInstruction).instruction);
+        await sendFollowUpDirect((nextItem as QueuedInstruction).instruction);
+        setInstructionQueue(prev => prev.map(i => i.id === (nextItem as QueuedInstruction).id ? { ...i, status: 'done' } : i));
+      } catch (e) {
+        setInstructionQueue(prev => prev.map(i => i.id === (nextItem as QueuedInstruction).id ? { ...i, status: 'failed' } : i));
+      }
+
+      // Auto-clear done items older than 5 seconds
+      setTimeout(() => {
+        setInstructionQueue(prev => prev.filter(i => i.status !== 'done'));
+      }, 5000);
+    }
+
+    isProcessingQueue.current = false;
+  };
+
+  // Public send handler (used by button/Enter)
+  const sendFollowUp = async () => {
+    if (!followUp.trim()) return;
+    if (isGenerating) {
+      addToQueue(followUp);
+      setFollowUp('');
+      return;
+    }
+
+    // Agent free — send immediately
+    const toSend = followUp;
+    setFollowUp('');
+    await sendFollowUpDirect(toSend);
+  };
+
   const startNewProject = () => {
     confirmAction({
       title: 'Initialize New Cluster?',
@@ -983,11 +1364,16 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
         setRectifiedPrompt('');
         setFollowUp('');
         setChatHistory([]);
+        setClarifications([]);
+        setIsClarifying(false);
         setActiveTab('workspace');
         setCompressedContext('');
         setProjectFiles({});
         setSelectedFile('');
         setActiveAgents({});
+        setActiveSession(null);
+        setResumeCheckpoint(null);
+        localStorage.removeItem('ai-architect-last-session-id');
         showToast('Environment reset to baseline', 'success');
       }
     });
@@ -1011,9 +1397,52 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
     });
   };
 
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-[#f7f6f2] flex items-center justify-center">
+        {statusOverlays}
+        <LoaderCircle className="w-8 h-8 animate-spin text-[#01696f]" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-[#f7f6f2] flex items-center justify-center px-6 text-[#2d2d2d]">
+        {statusOverlays}
+        <motion.div className="w-full max-w-sm bg-[#f9f8f5] shadow-warm rounded-[16px] p-10 border border-alpha text-center">
+          <div className="flex items-center justify-center gap-3 mb-4">
+            <Box className="w-8 h-8 text-[#01696f]" />
+            <h1 className="text-2xl font-bold font-display">AI Architect</h1>
+          </div>
+          <p className="text-sm uppercase tracking-[0.25em] text-[#6b6b6b] font-bold mb-10">The Agentic Full-Stack Engineer</p>
+          <div className="space-y-3">
+            <motion.button whileTap={{ scale: 0.98 }} onClick={() => signInWithGoogle()} className="w-full bg-white border border-alpha rounded-[12px] px-4 py-3.5 flex items-center justify-center gap-3 font-bold premium-transition hover:shadow-sm">
+              <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+                <path fill="#EA4335" d="M24 9.5c3.54 0 6.72 1.22 9.23 3.6l6.9-6.9C35.94 2.57 30.52 0 24 0 14.62 0 6.49 5.38 2.51 13.21l8.03 6.23C12.43 13.02 17.64 9.5 24 9.5z" />
+                <path fill="#4285F4" d="M46.5 24.5c0-1.58-.14-3.1-.39-4.5H24v9h12.72c-.55 2.95-2.22 5.45-4.72 7.12l7.35 5.71C43.88 37.49 46.5 31.65 46.5 24.5z" />
+                <path fill="#FBBC05" d="M10.54 28.44A14.5 14.5 0 0 1 10 24c0-1.52.26-2.99.72-4.44l-8.03-6.23A23.96 23.96 0 0 0 0 24c0 3.84.91 7.47 2.51 10.67l8.03-6.23z" />
+                <path fill="#34A853" d="M24 48c6.52 0 11.96-2.16 15.94-5.88l-7.35-5.71c-2.04 1.37-4.66 2.18-8.59 2.18-6.36 0-11.57-3.52-13.46-8.5l-8.03 6.23C6.49 42.62 14.62 48 24 48z" />
+              </svg>
+              Continue with Google
+            </motion.button>
+            <motion.button whileTap={{ scale: 0.98 }} onClick={() => signInWithGithub()} className="w-full bg-[#24292e] text-white rounded-[12px] px-4 py-3.5 flex items-center justify-center gap-3 font-bold premium-transition hover:shadow-sm">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 .5C5.65.5.5 5.72.5 12.2c0 5.18 3.29 9.57 7.86 11.13.58.11.79-.26.79-.57v-2.2c-3.2.71-3.88-1.57-3.88-1.57-.52-1.37-1.27-1.74-1.27-1.74-1.04-.73.08-.72.08-.72 1.15.08 1.75 1.22 1.75 1.22 1.03 1.79 2.71 1.27 3.37.97.1-.75.4-1.27.73-1.56-2.55-.3-5.24-1.31-5.24-5.83 0-1.29.44-2.34 1.16-3.17-.12-.3-.5-1.5.11-3.13 0 0 .95-.31 3.11 1.21a10.4 10.4 0 0 1 5.66 0c2.16-1.52 3.11-1.21 3.11-1.21.61 1.63.23 2.83.11 3.13.72.83 1.16 1.88 1.16 3.17 0 4.53-2.69 5.53-5.25 5.82.41.36.78 1.07.78 2.16v3.2c0 .31.21.68.8.56 4.56-1.56 7.85-5.94 7.85-11.12C23.5 5.72 18.35.5 12 .5Z" />
+              </svg>
+              Continue with GitHub
+            </motion.button>
+          </div>
+          <p className="mt-8 text-xs text-[#6b6b6b]">By signing in, you agree to use this responsibly.</p>
+        </motion.div>
+      </div>
+    );
+  }
+
   if (view === 'landing') {
     return (
       <div className="min-h-screen bg-[#f7f6f2] text-[#2d2d2d] flex flex-col md:flex-row font-sans">
+        {statusOverlays}
         {/* Session Sidebar */}
         <div className="w-full md:w-80 bg-[#f9f8f5] border-r border-alpha p-8 flex flex-col shadow-warm">
            <div className="flex justify-between items-center mb-10">
@@ -1063,17 +1492,21 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
 
         {/* Main Content */}
         <div className="flex-1 relative overflow-y-auto custom-scrollbar pb-64">
-          <nav className="p-8 flex justify-between items-center sticky top-0 bg-[#f7f6f2]/80 backdrop-blur-[12px] z-20 border-b border-alpha transition-all duration-300">
-            <h1 className="text-2xl font-bold tracking-tight cursor-pointer flex items-center gap-3 font-display" onClick={startNewProject}>
-              <Box className="w-6 h-6 text-[#01696f]" />
-              AI Architect
-            </h1>
-            <div className="flex gap-6 items-center">
-              <button onClick={() => {
-                 confirmAction({
-                   title: 'Fast-Track Manifest?',
-                   description: 'This will spawn a clean session container immediately without pre-rectification logic. Continue?',
-                   confirmLabel: 'Spawn Container',
+           <nav className="p-8 flex justify-between items-center sticky top-0 bg-[#f7f6f2]/80 backdrop-blur-[12px] z-20 border-b border-alpha transition-all duration-300">
+              <h1 className="text-2xl font-bold tracking-tight cursor-pointer flex items-center gap-3 font-display" onClick={startNewProject}>
+                <Box className="w-6 h-6 text-[#01696f]" />
+                AI Architect
+              </h1>
+              <div className="flex gap-4 items-center">
+                <div className="flex items-center gap-3">
+                  <img src={user.photoURL || `https://api.dicebear.com/9.x/thumbs/svg?seed=${encodeURIComponent(user.displayName || user.email || user.uid)}`} alt={user.displayName || 'User'} className="w-8 h-8 rounded-full object-cover border border-alpha" />
+                  <span className="text-sm font-bold max-w-32 truncate">{user.displayName || user.email || 'Signed in'}</span>
+                </div>
+                <button onClick={() => {
+                  confirmAction({
+                    title: 'Fast-Track Manifest?',
+                    description: 'This will spawn a clean session container immediately without pre-rectification logic. Continue?',
+                    confirmLabel: 'Spawn Container',
                    onConfirm: async () => {
                       const ns = await createSession("New Sovereign Node");
                       if (ns) loadSession(ns);
@@ -1140,7 +1573,7 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                               const ns = await createSession(prompt.substring(0, 30) || "Dynamic Venture");
                               if (ns) {
                                   setActiveSession(ns);
-                                  rectifyPrompt(prompt);
+                                  askClarifications(prompt);
                               }
                           }}
                           disabled={!prompt.trim()}
@@ -1201,6 +1634,113 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                 </div>
               )}
               
+              {status === 'clarifying' && isClarifying && (
+                <div className="py-12 text-[#01696f] w-full text-center font-bold flex items-center justify-center gap-4 text-lg">
+                  <RefreshCcw className="w-6 h-6 animate-spin" />
+                  <span className="shimmer bg-clip-text text-transparent uppercase tracking-widest text-sm">
+                    Analyzing requirements...
+                  </span>
+                </div>
+              )}
+
+              {clarifications.length > 0 && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 20 }} 
+                  animate={{ opacity: 1, y: 0 }}
+                  className="w-full space-y-6 stagger-fade-in"
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-8 h-8 rounded-full bg-[#01696f15] flex items-center justify-center">
+                      <Bot className="w-4 h-4 text-[#01696f]" />
+                    </div>
+                    <div>
+                      <p className="font-bold text-[#2d2d2d] text-sm">Pre-Flight Check</p>
+                      <p className="text-[10px] text-[#6b6b6b] uppercase tracking-widest font-bold">
+                        {clarifications.length} question{clarifications.length > 1 ? 's' : ''} to optimize your build
+                      </p>
+                    </div>
+                  </div>
+
+                  {clarifications.map((q, idx) => (
+                    <motion.div
+                      key={q.id}
+                      initial={{ opacity: 0, y: 12 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: idx * 0.1 }}
+                      className="bg-[#f9f8f5] border border-alpha rounded-[12px] p-6"
+                    >
+                      <p className="font-bold text-[#2d2d2d] text-sm mb-4 flex items-start gap-2">
+                        <span className="text-[#01696f] font-black">{idx + 1}.</span>
+                        {q.question}
+                      </p>
+
+                      {q.type === 'yesno' && (
+                        <div className="flex gap-3">
+                          {['Yes', 'No'].map(opt => (
+                            <button
+                              key={opt}
+                              onClick={() => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: opt } : cq))}
+                              className={`flex-1 py-3 rounded-[8px] text-sm font-bold border premium-transition
+                                ${q.answer === opt 
+                                  ? 'bg-[#01696f] text-white border-[#01696f] shadow-lg shadow-[#01696f15]' 
+                                  : 'bg-[#f7f6f2] text-[#2d2d2d] border-alpha hover:border-[#01696f30] hover:bg-[#f3f0ec]'
+                                }`}
+                            >
+                              {opt === 'Yes' ? '✓ Yes' : '✗ No'}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {q.type === 'choice' && (
+                        <div className="flex flex-wrap gap-2">
+                          {(q.options || []).map(opt => (
+                            <button
+                              key={opt}
+                              onClick={() => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: opt } : cq))}
+                              className={`px-4 py-2 rounded-full text-xs font-bold border premium-transition
+                                ${q.answer === opt
+                                  ? 'bg-[#01696f] text-white border-[#01696f] shadow-md'
+                                  : 'bg-[#f7f6f2] text-[#6b6b6b] border-alpha hover:border-[#01696f30] hover:text-[#2d2d2d]'
+                                }`}
+                            >
+                              {opt}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {q.type === 'text' && (
+                        <input
+                          type="text"
+                          placeholder="Type your answer..."
+                          value={q.answer || ''}
+                          onChange={e => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: e.target.value } : cq))}
+                          className="w-full px-4 py-3 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm font-medium focus:ring-2 focus:ring-[#01696f20] focus:border-[#01696f] focus:outline-none premium-transition"
+                        />
+                      )}
+                    </motion.div>
+                  ))}
+
+                  <div className="flex gap-4">
+                    <motion.button
+                      whileHover={{ scale: 1.01 }}
+                      whileTap={{ scale: 0.98 }}
+                      onClick={submitClarifications}
+                      className="flex-1 py-4 bg-[#01696f] text-white rounded-[8px] font-bold shadow-xl shadow-[#01696f10] premium-transition"
+                    >
+                      Confirm & Build →
+                    </motion.button>
+                    <button
+                      onClick={() => { setClarifications([]); rectifyPrompt(prompt); }}
+                      className="px-8 py-4 bg-[#efebe3] text-[#2d2d2d] rounded-[8px] font-bold border border-alpha premium-transition hover:bg-[#e8e4dc]"
+                    >
+                      Skip — use defaults
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+
               {status === 'rectifying' && <div className="py-12 text-[#01696f] w-full text-center font-bold flex items-center justify-center gap-4 text-lg">
                 <RefreshCcw className="w-6 h-6 animate-spin" /> 
                 <span className="shimmer bg-clip-text text-transparent uppercase tracking-widest text-sm">Compressing requirements via Swarm Matrix...</span>
@@ -1228,6 +1768,7 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
 
   return (
     <div className="min-h-screen bg-[#f7f6f2] flex p-6 gap-6 max-h-screen overflow-hidden font-sans">
+      {statusOverlays}
       {/* Sidebar: Chat */}
       <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} className="w-80 lg:w-96 bg-[#f9f8f5] rounded-[12px] p-6 flex flex-col shadow-warm border border-alpha premium-transition">
         <div className="flex justify-between items-center mb-8 px-1">
@@ -1283,24 +1824,125 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
         </div>
 
         <div className="mt-auto">
+            {isGenerating && (
+              <div className="text-[9px] font-bold text-[#01696f] uppercase tracking-widest mb-2 flex items-center gap-2 px-1">
+                <div className="w-1.5 h-1.5 rounded-full bg-[#01696f] animate-pulse" />
+                Agent active — new instructions will be queued
+              </div>
+            )}
+
             <div className="relative">
                 <textarea
                     value={followUp}
                     onChange={(e) => setFollowUp(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendFollowUp(); }}}
-                    placeholder="Instruct Copilot..."
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        if (!followUp.trim()) return;
+                        if (isGenerating) {
+                          addToQueue(followUp);
+                        } else {
+                          sendFollowUpDirect(followUp);
+                        }
+                        setFollowUp('');
+                      }
+                    }}
+                    placeholder={isGenerating ? "Queue next instruction — agent will execute after current task..." : "Instruct Copilot..."}
                     className="w-full p-6 pr-16 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm focus:ring-2 focus:ring-[#01696f]/10 focus:border-[#01696f] focus:outline-none resize-none shadow-inner transition-all placeholder:text-[#6b6b6b]/40 font-medium"
                     rows={2}
-                    disabled={isGenerating}
                 />
                 <button 
-                  onClick={sendFollowUp}
-                  disabled={isGenerating || !followUp.trim()}
-                  className={`absolute right-4 bottom-4 p-3 rounded-[8px] transition scale-100 active:scale-95 ${isGenerating || !followUp.trim() ? 'bg-[#efebe3] text-[#6b6b6b]/30' : 'bg-[#01696f] text-white hover:bg-[#01696f]/90 shadow-lg shadow-[#01696f]/10'}`}
+                  onClick={() => {
+                    if (!followUp.trim()) return;
+                    if (isGenerating) {
+                      addToQueue(followUp);
+                      setFollowUp('');
+                    } else {
+                      sendFollowUpDirect(followUp);
+                      setFollowUp('');
+                    }
+                  }}
+                  className={`absolute right-4 bottom-4 p-3 rounded-[8px] transition scale-100 active:scale-95 ${!followUp.trim() ? 'bg-[#efebe3] text-[#6b6b6b]/30' : isGenerating ? 'bg-[#efebe3]' : 'bg-[#01696f] text-white hover:bg-[#01696f]/90 shadow-lg shadow-[#01696f]/10'}`}
                 >
-                    <Send className="w-4 h-4" />
+                    {isGenerating && followUp.trim() ? <List className="w-4 h-4" /> : <Send className="w-4 h-4" />}
                 </button>
             </div>
+
+            {/* Instruction Queue Panel */}
+            <AnimatePresence>
+              {instructionQueue.length > 0 && (
+                <motion.div
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 8 }}
+                  className="mt-3 bg-[#f7f6f2] border border-alpha rounded-[10px] overflow-hidden"
+                >
+                  <div className="px-4 py-2.5 flex items-center justify-between border-b border-alpha">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-[#6b6b6b] flex items-center gap-2">
+                      <List className="w-3 h-3" />
+                      QUEUED ({instructionQueue.filter(i => i.status === 'queued').length})
+                    </span>
+                    <button
+                      onClick={() => setInstructionQueue([])}
+                      className="text-[10px] text-[#6b6b6b] hover:text-red-500 font-bold premium-transition"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+
+                  <div className="max-h-40 overflow-y-auto custom-scrollbar">
+                    {instructionQueue.map((item, idx) => (
+                      <motion.div
+                        key={item.id}
+                        initial={{ opacity: 0, x: -8 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 8 }}
+                        transition={{ delay: idx * 0.05 }}
+                        className={`px-4 py-3 flex items-start gap-3 border-b border-alpha last:border-0
+                          ${item.status === 'processing' ? 'bg-[#01696f08]' : ''}
+                        `}
+                      >
+                        <div className="mt-0.5 shrink-0">
+                          {item.status === 'queued' && (
+                            <div className="w-2 h-2 rounded-full bg-[#6b6b6b30] border border-[#6b6b6b40]" />
+                          )}
+                          {item.status === 'processing' && (
+                            <div className="w-2 h-2 rounded-full bg-[#01696f] animate-pulse" />
+                          )}
+                          {item.status === 'done' && (
+                            <Check className="w-3 h-3 text-[#437a22]" />
+                          )}
+                          {item.status === 'failed' && (
+                            <X className="w-3 h-3 text-red-400" />
+                          )}
+                        </div>
+
+                        <p className={`text-[11px] font-medium leading-relaxed flex-1 truncate
+                          ${item.status === 'processing' ? 'text-[#01696f] font-bold' : 'text-[#6b6b6b]'}
+                          ${item.status === 'done' ? 'line-through opacity-40' : ''}
+                        `}>
+                          {item.status === 'processing' && (
+                            <span className="text-[9px] font-black uppercase tracking-widest block text-[#01696f] mb-1">
+                              ↳ Executing...
+                            </span>
+                          )}
+                          {item.instruction}
+                        </p>
+
+                        {item.status === 'queued' && (
+                          <button
+                            onClick={() => setInstructionQueue(prev => prev.filter(i => i.id !== item.id))}
+                            className="shrink-0 opacity-30 hover:opacity-100 premium-transition"
+                          >
+                            <X className="w-3 h-3 text-[#6b6b6b]" />
+                          </button>
+                        )}
+                      </motion.div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
         </div>
       </motion.div>
 
@@ -1339,6 +1981,10 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                         Persisting State...
                     </div>
                 )}
+                <div className="flex items-center gap-3">
+                  <img src={user.photoURL || `https://api.dicebear.com/9.x/thumbs/svg?seed=${encodeURIComponent(user.displayName || user.email || user.uid)}`} alt={user.displayName || 'User'} className="w-8 h-8 rounded-full object-cover border border-alpha" />
+                  <span className="text-xs font-bold max-w-32 truncate">{user.displayName || user.email || 'Signed in'}</span>
+                </div>
                 <div className="flex gap-2">
                    <button onClick={() => setView('landing')} className="p-2 hover:bg-[#efebe3] rounded-[8px] border border-alpha premium-transition">
                        <X className="w-4 h-4 text-[#6b6b6b]" />
@@ -1406,6 +2052,9 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                         <div className="flex items-center gap-3 mr-6">
                             <Sparkles className="w-5 h-5 text-[#01696f] animate-pulse" />
                             <span className="text-[11px] font-bold text-[#01696f] uppercase tracking-[0.2em] font-sans">Active Swarm Activity</span>
+                            {isGenerating && !isOnline && (
+                              <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-bold uppercase tracking-widest">Queued — will resume on reconnect</span>
+                            )}
                         </div>
                         {Object.entries(activeAgents).map(([role, model]) => (
                             <div key={role} className="flex items-center gap-3 bg-white px-4 py-2 rounded-full border border-alpha shadow-sm text-[11px] premium-transition hover:scale-105">
@@ -1685,7 +2334,7 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                             {isGenerating && (
                                 <div className="absolute inset-0 bg-[#f9f8f5]/80 backdrop-blur-sm z-10 flex flex-col items-center justify-center gap-4">
                                     <RefreshCcw className="w-8 h-8 text-[#01696f] animate-spin" />
-                                    <span className="text-xs font-bold text-[#01696f] uppercase tracking-[0.2em] font-sans">Hot Reloading State Tree...</span>
+                                    <span className="text-xs font-bold text-[#01696f] uppercase tracking-[0.2em] font-sans">{!isOnline ? 'Queued — will resume on reconnect' : 'Hot Reloading State Tree...'}</span>
                                 </div>
                             )}
                             <iframe 
@@ -1867,7 +2516,13 @@ Recreate this website as a pixel-accurate React 19 + Tailwind CSS clone.
                     </section>
                   </div>
                   <div className="p-8 bg-[#f7f6f2] border-t border-alpha">
-                      <button className="w-full py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-lg shadow-[#01696f]/10 premium-transition">Synchronize State</button>
+                      <div className="space-y-3">
+                        <button className="w-full py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-lg shadow-[#01696f]/10 premium-transition">Synchronize State</button>
+                        <button onClick={async () => { await logout(); setView('landing'); setActiveSession(null); setIsDrawerOpen(false); localStorage.removeItem('ai-architect-last-session-id'); }} className="w-full py-4 bg-white text-[#2d2d2d] font-bold rounded-[8px] border border-alpha premium-transition flex items-center justify-center gap-2">
+                          <LogOut className="w-4 h-4" />
+                          Sign Out
+                        </button>
+                      </div>
                   </div>
                 </motion.div>
               </div>

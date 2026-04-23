@@ -5,45 +5,16 @@ import * as cheerio from "cheerio";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import Database from "better-sqlite3";
+import { createClient } from "@libsql/client";
 import { v4 as uuidv4 } from "uuid";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Database
-const db = new Database("architect.db");
-db.pragma("foreign_keys = ON");
-
-// Create Tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    last_modified INTEGER NOT NULL,
-    model_config TEXT DEFAULT '{}'
-  );
-
-  CREATE TABLE IF NOT EXISTS files (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    content TEXT,
-    language TEXT,
-    last_modified INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS terminal_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    command TEXT,
-    output TEXT,
-    timestamp INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-`);
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL!,
+  authToken: process.env.TURSO_AUTH_TOKEN!,
+});
 
 const getSessionDir = (sessionId: string) => {
   const dir = path.join("/tmp", `ai-architect-${sessionId}`);
@@ -51,14 +22,76 @@ const getSessionDir = (sessionId: string) => {
   return dir;
 };
 
+type DbRow = Record<string, any>;
+
+declare global {
+  namespace Express {
+    interface Request {
+      userId?: string;
+    }
+  }
+}
+
+const execute = async (sql: string, args: any[] = []) => db.execute({ sql, args });
+const getRows = async <T extends DbRow = DbRow>(sql: string, args: any[] = []) =>
+  ((await execute(sql, args)).rows as unknown as T[]);
+const getRow = async <T extends DbRow = DbRow>(sql: string, args: any[] = []) =>
+  (((await execute(sql, args)).rows[0] as unknown) as T | undefined);
+const run = async (sql: string, args: any[] = []) => execute(sql, args);
+const initSchema = async () => {
+  await db.executeMultiple(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_modified INTEGER NOT NULL,
+      model_config TEXT DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS files (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      content TEXT,
+      language TEXT,
+      last_modified INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS terminal_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      command TEXT,
+      output TEXT,
+      timestamp INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      session_id TEXT PRIMARY KEY,
+      phase TEXT NOT NULL,
+      files TEXT NOT NULL,
+      chat_history TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+  `);
+};
+
 // --- PREVIEW SYSTEM ---
 const previewProcesses = new Map<string, { process: any; port: number }>();
 
 async function startServer() {
+  await initSchema();
   const app = express();
   const PORT = 3000;
 
   app.use(express.json({ limit: '50mb' }));
+  app.use("/api/sessions", (req, _res, next) => {
+    req.userId = req.header("X-User-Id") || undefined;
+    next();
+  });
 
   // --- RATE LIMITER ---
   const rateLimitMap = new Map<string, { count: number; lastReset: number }>();
@@ -311,15 +344,23 @@ async function startServer() {
   // --- PERSISTENCE API ---
 
   // 1. Create a new session
-  app.post("/api/sessions", (req, res) => {
-    const { name, modelConfig } = req.body;
+  app.post("/api/sessions", async (req, res) => {
+    const { name, modelConfig, userId: bodyUserId } = req.body;
+    const userId = req.userId || bodyUserId;
+    if (!userId) return res.status(400).json({ error: "Missing user id" });
     const id = uuidv4();
     const now = Date.now();
     const config = JSON.stringify(modelConfig || {});
     
     try {
-      const stmt = db.prepare("INSERT INTO sessions (id, name, created_at, last_modified, model_config) VALUES (?, ?, ?, ?, ?)");
-      stmt.run(id, name || "Untitled Project", now, now, config);
+      await run("INSERT INTO sessions (id, user_id, name, created_at, last_modified, model_config) VALUES (?, ?, ?, ?, ?, ?)", [
+        id,
+        userId,
+        name || "Untitled Project",
+        now,
+        now,
+        config,
+      ]);
       res.json({ id, name, created_at: now, last_modified: now, model_config: modelConfig || {} });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -327,9 +368,9 @@ async function startServer() {
   });
 
   // 2. List all sessions
-  app.get("/api/sessions", (req, res) => {
+  app.get("/api/sessions", async (req, res) => {
     try {
-      const sessions = db.prepare("SELECT * FROM sessions ORDER BY last_modified DESC").all();
+      const sessions = await getRows("SELECT * FROM sessions WHERE user_id = ? ORDER BY last_modified DESC", [req.userId || ""]);
       res.json(sessions.map((s: any) => ({ ...s, model_config: JSON.parse(s.model_config) })));
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -337,9 +378,9 @@ async function startServer() {
   });
 
   // 3. Get session with metadata
-  app.get("/api/sessions/:id", (req, res) => {
+  app.get("/api/sessions/:id", async (req, res) => {
     try {
-      const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(req.params.id);
+      const session = await getRow("SELECT * FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
       if (!session) return res.status(404).json({ error: "Session not found" });
       res.json({ ...session as object, model_config: JSON.parse((session as any).model_config) });
     } catch (err: any) {
@@ -348,12 +389,17 @@ async function startServer() {
   });
 
   // 4. Update session metadata
-  app.put("/api/sessions/:id", (req, res) => {
+  app.put("/api/sessions/:id", async (req, res) => {
     const { name, modelConfig } = req.body;
     const now = Date.now();
     try {
-      const stmt = db.prepare("UPDATE sessions SET name = COALESCE(?, name), model_config = COALESCE(?, model_config), last_modified = ? WHERE id = ?");
-      stmt.run(name, modelConfig ? JSON.stringify(modelConfig) : null, now, req.params.id);
+      await run("UPDATE sessions SET name = COALESCE(?, name), model_config = COALESCE(?, model_config), last_modified = ? WHERE id = ? AND user_id = ?", [
+        name,
+        modelConfig ? JSON.stringify(modelConfig) : null,
+        now,
+        req.params.id,
+        req.userId || "",
+      ]);
       res.json({ status: "ok", last_modified: now });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -361,9 +407,9 @@ async function startServer() {
   });
 
   // 5. Delete session
-  app.delete("/api/sessions/:id", (req, res) => {
+  app.delete("/api/sessions/:id", async (req, res) => {
     try {
-      db.prepare("DELETE FROM sessions WHERE id = ?").run(req.params.id);
+      await run("DELETE FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
       res.json({ status: "ok" });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -371,17 +417,25 @@ async function startServer() {
   });
 
   // 6. Save a file to a session
-  app.post("/api/sessions/:id/files", (req, res) => {
+  app.post("/api/sessions/:id/files", async (req, res) => {
     const { path: filePath, content, language } = req.body;
     const sessionId = req.params.id;
     const id = uuidv4();
     const now = Date.now();
     try {
-      const stmt = db.prepare("INSERT INTO files (id, session_id, path, content, language, last_modified) VALUES (?, ?, ?, ?, ?, ?)");
-      stmt.run(id, sessionId, filePath, content, language, now);
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [sessionId, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      await run("INSERT INTO files (id, session_id, path, content, language, last_modified) VALUES (?, ?, ?, ?, ?, ?)", [
+        id,
+        sessionId,
+        filePath,
+        content,
+        language,
+        now,
+      ]);
       
       // Update session last_modified
-      db.prepare("UPDATE sessions SET last_modified = ? WHERE id = ?").run(now, sessionId);
+      await run("UPDATE sessions SET last_modified = ? WHERE id = ? AND user_id = ?", [now, sessionId, req.userId || ""]);
       
       res.json({ id, path: filePath, content, language, last_modified: now });
     } catch (err: any) {
@@ -390,9 +444,11 @@ async function startServer() {
   });
 
   // 7. Get all files in a session
-  app.get("/api/sessions/:id/files", (req, res) => {
+  app.get("/api/sessions/:id/files", async (req, res) => {
     try {
-      const files = db.prepare("SELECT * FROM files WHERE session_id = ?").all(req.params.id);
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      const files = await getRows("SELECT * FROM files WHERE session_id = ?", [req.params.id]);
       res.json(files);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -400,12 +456,14 @@ async function startServer() {
   });
 
   // 8. Update file content
-  app.put("/api/sessions/:id/files/:fileId", (req, res) => {
+  app.put("/api/sessions/:id/files/:fileId", async (req, res) => {
     const { content } = req.body;
     const now = Date.now();
     try {
-      db.prepare("UPDATE files SET content = ?, last_modified = ? WHERE id = ?").run(content, now, req.params.fileId);
-      db.prepare("UPDATE sessions SET last_modified = ? WHERE id = ?").run(now, req.params.id);
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      await run("UPDATE files SET content = ?, last_modified = ? WHERE id = ? AND session_id = ?", [content, now, req.params.fileId, req.params.id]);
+      await run("UPDATE sessions SET last_modified = ? WHERE id = ? AND user_id = ?", [now, req.params.id, req.userId || ""]);
       res.json({ status: "ok", last_modified: now });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -413,11 +471,13 @@ async function startServer() {
   });
 
   // 9. Append terminal history
-  app.post("/api/sessions/:id/terminal-history", (req, res) => {
+  app.post("/api/sessions/:id/terminal-history", async (req, res) => {
     const { command, output } = req.body;
     const now = Date.now();
     try {
-      db.prepare("INSERT INTO terminal_history (session_id, command, output, timestamp) VALUES (?, ?, ?, ?)").run(req.params.id, command, output, now);
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      await run("INSERT INTO terminal_history (session_id, command, output, timestamp) VALUES (?, ?, ?, ?)", [req.params.id, command, output, now]);
       res.json({ status: "ok", timestamp: now });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -425,10 +485,40 @@ async function startServer() {
   });
 
   // 10. Get terminal history
-  app.get("/api/sessions/:id/terminal-history", (req, res) => {
+  app.get("/api/sessions/:id/terminal-history", async (req, res) => {
     try {
-      const history = db.prepare("SELECT * FROM terminal_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100").all();
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      const history = await getRows("SELECT * FROM terminal_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100", [req.params.id]);
       res.json(history.reverse());
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/sessions/:id/checkpoint", async (req, res) => {
+    try {
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      const checkpoint = await getRow("SELECT * FROM checkpoints WHERE session_id = ?", [req.params.id]);
+      if (!checkpoint) return res.status(404).json({ error: "Checkpoint not found" });
+      res.json(checkpoint);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/sessions/:id/checkpoint", async (req, res) => {
+    try {
+      const { phase, files, chatHistory } = req.body;
+      const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
+      if (!session) return res.status(404).json({ error: "Session not found" });
+      const now = Date.now();
+      await run(
+        "INSERT INTO checkpoints (session_id, phase, files, chat_history, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET phase = excluded.phase, files = excluded.files, chat_history = excluded.chat_history, updated_at = excluded.updated_at",
+        [req.params.id, phase, JSON.stringify(files), JSON.stringify(chatHistory), now]
+      );
+      res.json({ status: "ok", updated_at: now });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
