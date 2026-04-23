@@ -133,6 +133,19 @@ async function startServer() {
     }
   });
 
+  app.post("/api/proxy/tavily", rateLimiter, async (req, res) => {
+    try {
+      const { query } = req.body;
+      const data = await proxyRequest("https://api.tavily.com/search", process.env.TAVILY_API_KEY, {
+        api_key: process.env.TAVILY_API_KEY,
+        query
+      });
+      res.json(data);
+    } catch (err: any) {
+      res.status(err.status || 500).json({ error: err.message, body: err.body });
+    }
+  });
+
   // API v1 - IDE Backend
   app.post("/api/v1/write", async (req, res) => {
     try {
@@ -333,7 +346,7 @@ async function startServer() {
   // 7. Get all files in a session
   app.get("/api/sessions/:id/files", (req, res) => {
     try {
-      const files = db.prepare("SELECT * FROM files WHERE session_id = ?").all();
+      const files = db.prepare("SELECT * FROM files WHERE session_id = ?").all(req.params.id);
       res.json(files);
     } catch (err: any) {
       res.status(500).json({ error: err.message });

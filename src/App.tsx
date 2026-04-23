@@ -6,6 +6,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import * as motion from 'motion/react-client';
+import { AnimatePresence } from 'motion/react';
 import { 
     Send, Play, Code2, Layout as LayoutIcon, RefreshCcw, 
     Box, FileCode, ChevronRight, CheckCircle2, Server, Globe, Layers, Sparkles,
@@ -170,6 +171,8 @@ export default function App() {
   const [commandQueue, setCommandQueue] = useState<CommandQueueItem[]>([]);
   const [aiExecuteMode, setAiExecuteMode] = useState(true);
   const [isRecompiling, setIsRecompiling] = useState(false);
+  const [isDarkEnvironment, setIsDarkEnvironment] = useState(false);
+  const [isHighPrecision, setIsHighPrecision] = useState(true);
   const compileTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -476,13 +479,11 @@ export default function App() {
       log(`Execution Triggered: ${name}(${JSON.stringify(args)})`, 'tool');
 
       if (name === 'tavily_dependency_check') {
-          const tavilyKey = import.meta.env.VITE_TAVILY_API_KEY;
-          if (!tavilyKey) return `// Tavily API Key missing.`;
           try {
-              const res = await fetch('https://api.tavily.com/search', {
+              const res = await fetch('/api/proxy/tavily', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ api_key: tavilyKey, query: `latest stable version and breaking changes of ${args.package_name} for ${args.framework}` })
+                  body: JSON.stringify({ query: `latest stable version and breaking changes of ${args.package_name} for ${args.framework}` })
               });
               const data = await res.json();
               return `// Tavily Verified Check: ${data.results?.[0]?.content || 'Assumed Stable based on sparse data.'}`;
@@ -1465,28 +1466,30 @@ export default function App() {
           <>
             {/* Toast System */}
             <div className="fixed top-8 right-8 z-[100] flex flex-col gap-2 pointer-events-none">
-              {toasts.map((t) => (
-                <motion.div
-                  key={t.id}
-                  initial={{ x: 100, opacity: 0 }}
-                  animate={{ x: 0, opacity: 1 }}
-                  exit={{ x: 100, opacity: 0 }}
-                  className="pointer-events-auto bg-[#f9f8f5] shadow-warm border border-alpha rounded-full px-5 py-3 flex items-center gap-3 group relative overflow-hidden"
-                >
-                  <div className={`w-2 h-2 rounded-full ${t.type === 'success' ? 'bg-[#01696f]' : t.type === 'error' ? 'bg-rose-500' : t.type === 'warning' ? 'bg-amber-500' : 'bg-[#6b6b6b]'}`} />
-                  <span className="text-sm font-bold text-[#2d2d2d] pr-4">{t.message}</span>
-                  <button onClick={() => removeToast(t.id)} className="p-1 hover:bg-[#efebe3] rounded-full transition-colors opacity-0 group-hover:opacity-100">
-                    <X className="w-3 h-3 text-[#6b6b6b]" />
-                  </button>
-                  <motion.div 
-                    initial={{ width: '100%' }} 
-                    animate={{ width: 0 }} 
-                    transition={{ duration: 3, ease: 'linear' }}
-                    onAnimationComplete={() => removeToast(t.id)}
-                    className="absolute bottom-0 left-0 h-0.5 bg-[#01696f]/20"
-                  />
-                </motion.div>
-              ))}
+              <AnimatePresence mode="popLayout">
+                {toasts.map((t) => (
+                  <motion.div
+                    key={t.id}
+                    initial={{ x: 100, opacity: 0 }}
+                    animate={{ x: 0, opacity: 1 }}
+                    exit={{ x: 100, opacity: 0 }}
+                    className="pointer-events-auto bg-[#f9f8f5] shadow-warm border border-alpha rounded-full px-5 py-3 flex items-center gap-3 group relative overflow-hidden"
+                  >
+                    <div className={`w-2 h-2 rounded-full ${t.type === 'success' ? 'bg-[#01696f]' : t.type === 'error' ? 'bg-rose-500' : t.type === 'warning' ? 'bg-amber-500' : 'bg-[#6b6b6b]'}`} />
+                    <span className="text-sm font-bold text-[#2d2d2d] pr-4">{t.message}</span>
+                    <button onClick={() => removeToast(t.id)} className="p-1 hover:bg-[#efebe3] rounded-full transition-colors opacity-0 group-hover:opacity-100">
+                      <X className="w-3 h-3 text-[#6b6b6b]" />
+                    </button>
+                    <motion.div 
+                      initial={{ width: '100%' }} 
+                      animate={{ width: 0 }} 
+                      transition={{ duration: 3, ease: 'linear' }}
+                      onAnimationComplete={() => removeToast(t.id)}
+                      className="absolute bottom-0 left-0 h-0.5 bg-[#01696f]/20"
+                    />
+                  </motion.div>
+                ))}
+              </AnimatePresence>
             </div>
 
             {/* Confirmation Modal */}
@@ -1559,13 +1562,29 @@ export default function App() {
                     <section>
                         <h4 className="text-[10px] font-bold text-[#6b6b6b] uppercase tracking-[0.2em] mb-4">Preferences</h4>
                         <div className="space-y-4">
-                            <div className="flex justify-between items-center bg-white p-4 rounded-[8px] border border-alpha shadow-sm">
+                            <div 
+                                onClick={() => setIsHighPrecision(!isHighPrecision)}
+                                className="flex justify-between items-center bg-white p-4 rounded-[8px] border border-alpha shadow-sm cursor-pointer select-none"
+                            >
                                 <span className="text-sm font-bold text-[#2d2d2d]">High-Precision Mode</span>
-                                <div className="w-10 h-5 bg-[#01696f] rounded-full relative"><div className="absolute right-1 top-1 w-3 h-3 bg-white rounded-full"></div></div>
+                                <div className={`w-10 h-5 rounded-full relative premium-transition ${isHighPrecision ? 'bg-[#01696f]' : 'bg-[#efebe3]'}`}>
+                                    <motion.div 
+                                        animate={{ x: isHighPrecision ? 20 : 0 }}
+                                        className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full shadow-sm"
+                                    />
+                                </div>
                             </div>
-                            <div className="flex justify-between items-center bg-white p-4 rounded-[8px] border border-alpha shadow-sm">
+                            <div 
+                                onClick={() => setIsDarkEnvironment(!isDarkEnvironment)}
+                                className="flex justify-between items-center bg-white p-4 rounded-[8px] border border-alpha shadow-sm cursor-pointer select-none"
+                            >
                                 <span className="text-sm font-bold text-[#2d2d2d]">Dark Environment</span>
-                                <div className="w-10 h-5 bg-[#efebe3] rounded-full relative"><div className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full border border-alpha"></div></div>
+                                <div className={`w-10 h-5 rounded-full relative premium-transition ${isDarkEnvironment ? 'bg-[#01696f]' : 'bg-[#efebe3]'}`}>
+                                    <motion.div 
+                                        animate={{ x: isDarkEnvironment ? 20 : 0 }}
+                                        className="absolute left-1 top-1 w-3 h-3 bg-white rounded-full shadow-sm"
+                                    />
+                                </div>
                             </div>
                         </div>
                     </section>
