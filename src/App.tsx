@@ -225,7 +225,7 @@ export default function App() {
   const [isRecompiling, setIsRecompiling] = useState(false);
   const [isDarkEnvironment, setIsDarkEnvironment] = useState(false);
   const [isHighPrecision, setIsHighPrecision] = useState(true);
-  const compileTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const compileTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
@@ -306,6 +306,26 @@ export default function App() {
     ...extra,
   });
 
+  const safeLocalStorage = {
+    get: (key: string) => {
+      try {
+        return localStorage.getItem(key);
+      } catch {
+        return null;
+      }
+    },
+    set: (key: string, value: string) => {
+      try {
+        localStorage.setItem(key, value);
+      } catch {}
+    },
+    remove: (key: string) => {
+      try {
+        localStorage.removeItem(key);
+      } catch {}
+    },
+  };
+
   const loadCheckpoint = async (sessionId: string) => {
     try {
       const res = await fetchWithRetry(`/api/sessions/${sessionId}/checkpoint`, {
@@ -344,7 +364,7 @@ export default function App() {
       });
       const data = await res.json();
       setSessions(data);
-      const savedSessionId = localStorage.getItem('ai-architect-last-session-id');
+      const savedSessionId = safeLocalStorage.get('ai-architect-last-session-id');
       if (savedSessionId) {
         const savedSession = data.find((s: Session) => s.id === savedSessionId);
         if (savedSession) {
@@ -366,7 +386,7 @@ export default function App() {
       });
       const newSession = await res.json();
       setSessions(prev => [newSession, ...prev]);
-      localStorage.setItem('ai-architect-last-session-id', newSession.id);
+      safeLocalStorage.set('ai-architect-last-session-id', newSession.id);
       return newSession;
     } catch (e) {
       showToast('Failed to create session', 'error');
@@ -375,7 +395,7 @@ export default function App() {
 
   const loadSession = async (session: Session) => {
     setActiveSession(session);
-    localStorage.setItem('ai-architect-last-session-id', session.id);
+    safeLocalStorage.set('ai-architect-last-session-id', session.id);
     setPrompt(session.name);
     setRectifiedPrompt(session.name);
     setView('building');
@@ -460,7 +480,7 @@ export default function App() {
     }
   };
 
-  const autoSaveTimerRef = useRef<NodeJS.Timeout|null>(null);
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleFileChange = (filename: string, content: string) => {
       const newFiles = { ...filesSnapshotRef.current, [filename]: content };
@@ -618,7 +638,7 @@ export default function App() {
         const data = await attemptFetch(task.provider, task.model);
         return data.choices?.[0]?.message;
     } catch (err: any) {
-        const statusCode = Number((err as any)?.status) || Number(err.message.match(/\b(401|403|404|429|503)\b/)?.[1] || 0);
+        const statusCode = Number((err as any)?.status || 0) || Number(err.message.match(/\b(401|403|404|429|503)\b/)?.[1] || 0);
         if (statusCode === 401 || statusCode === 403 || statusCode === 404 || statusCode === 429 || statusCode === 503 || err.message.includes('timeout')) {
             if ('fallback' in task && task.fallback) {
                 if (logger) logger(`${task.provider === 'openrouter' ? 'OpenRouter' : 'NVIDIA'} ${err.message.replace('HTTP', '')} -> Fallback: Groq ${task.fallback.model}`, 'warning');
@@ -672,7 +692,7 @@ export default function App() {
           try {
               const res = await fetchWithRetry('/api/v1/write', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: sessionHeaders(),
                   body: JSON.stringify({ files: args.files, sessionId: activeSession?.id })
               });
               return `// Files synced successfully.`;
@@ -1396,7 +1416,7 @@ Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> 
         setActiveAgents({});
         setActiveSession(null);
         setResumeCheckpoint(null);
-        localStorage.removeItem('ai-architect-last-session-id');
+        safeLocalStorage.remove('ai-architect-last-session-id');
         showToast('Environment reset to baseline', 'success');
       }
     });
@@ -1872,7 +1892,7 @@ Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> 
                   <div className="p-8 bg-[#f7f6f2] border-t border-alpha">
                       <div className="space-y-3">
                         <button className="w-full py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-lg shadow-[#01696f]/10 premium-transition">Synchronize State</button>
-                        <button onClick={async () => { await logout(); setView('landing'); setActiveSession(null); setIsDrawerOpen(false); localStorage.removeItem('ai-architect-last-session-id'); }} className="w-full py-4 bg-white text-[#2d2d2d] font-bold rounded-[8px] border border-alpha premium-transition flex items-center justify-center gap-2">
+                        <button onClick={async () => { await logout(); setView('landing'); setActiveSession(null); setIsDrawerOpen(false); safeLocalStorage.remove('ai-architect-last-session-id'); }} className="w-full py-4 bg-white text-[#2d2d2d] font-bold rounded-[8px] border border-alpha premium-transition flex items-center justify-center gap-2">
                           <LogOut className="w-4 h-4" />
                           Sign Out
                         </button>

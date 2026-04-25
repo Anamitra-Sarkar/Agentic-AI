@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { exec, spawn } from "child_process";
@@ -14,9 +15,16 @@ import { Readable } from "stream";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const tursoDatabaseUrl = process.env.TURSO_DATABASE_URL;
+const tursoAuthToken = process.env.TURSO_AUTH_TOKEN;
+
+if (!tursoDatabaseUrl || !tursoAuthToken) {
+  throw new Error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN.");
+}
+
 const db = createClient({
-  url: process.env.TURSO_DATABASE_URL!,
-  authToken: process.env.TURSO_AUTH_TOKEN!,
+  url: tursoDatabaseUrl,
+  authToken: tursoAuthToken,
 });
 
 const getSessionDir = (sessionId: string) => {
@@ -92,7 +100,7 @@ async function startServer() {
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true }));
-  app.use("/api/sessions", (req, _res, next) => {
+  app.use((req, _res, next) => {
     req.userId = req.header("X-User-Id") || undefined;
     next();
   });
@@ -120,6 +128,20 @@ async function startServer() {
       return res.status(429).json({ error: "Rate limit exceeded. Try again in a minute." });
     }
     next();
+  };
+
+  const requireSessionUser = async (req: any, res: any, sessionId: string) => {
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: "Unauthorized" });
+      return null;
+    }
+    const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [sessionId, userId]);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return null;
+    }
+    return session;
   };
 
   // --- PROXY ENDPOINTS ---
@@ -239,11 +261,17 @@ async function startServer() {
   app.post("/api/proxy/tavily", rateLimiter, async (req, res) => {
     try {
       const { query } = req.body;
-      const data = await proxyRequest("https://api.tavily.com/search", process.env.TAVILY_API_KEY, {
+      const data = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
         api_key: process.env.TAVILY_API_KEY,
         query
+        })
       });
-      res.json(data);
+      res.json(await data.json());
     } catch (err: any) {
       res.status(err.status || 500).json({ error: err.message, body: err.body });
     }
@@ -295,7 +323,9 @@ async function startServer() {
   app.post("/api/v1/write", async (req, res) => {
     try {
       const { files, sessionId } = req.body;
-      const baseDir = sessionId ? getSessionDir(sessionId) : process.cwd();
+      if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+      if (!(await requireSessionUser(req, res, sessionId))) return;
+      const baseDir = getSessionDir(sessionId);
       
       for (const [filePath, content] of Object.entries(files)) {
         const fullPath = path.join(baseDir, filePath as string);
@@ -313,6 +343,8 @@ async function startServer() {
 
   app.post("/api/terminal/execute", async (req, res) => {
     const { command, sessionId, timeout = 30000 } = req.body;
+    if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+    if (!(await requireSessionUser(req, res, sessionId))) return;
     const cwd = getSessionDir(sessionId);
     
     const child = spawn('/bin/bash', ['-c', command], { 
@@ -339,7 +371,16 @@ async function startServer() {
 
   app.post("/api/terminal/execute-stream", (req, res) => {
     const { command, sessionId } = req.body;
+    const timeoutMs = 30000;
+    if (!sessionId) {
+      res.status(400).json({ error: "Missing sessionId" });
+      return;
+    }
     const cwd = getSessionDir(sessionId);
+    if (!req.userId) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -353,11 +394,17 @@ async function startServer() {
     });
 
     const send = (data: any) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+    const timer = setTimeout(() => {
+      child.kill();
+      send({ type: 'exit', code: 124 });
+      res.end();
+    }, timeoutMs);
 
     child.stdout.on('data', (data) => send({ type: 'stdout', content: data.toString() }));
     child.stderr.on('data', (data) => send({ type: 'stderr', content: data.toString() }));
     
     child.on('close', (code) => {
+      clearTimeout(timer);
       send({ type: 'exit', code });
       res.end();
     });
@@ -555,8 +602,8 @@ async function startServer() {
     try {
       const session = await getRow("SELECT id FROM sessions WHERE id = ? AND user_id = ?", [req.params.id, req.userId || ""]);
       if (!session) return res.status(404).json({ error: "Session not found" });
-      const history = await getRows("SELECT * FROM terminal_history WHERE session_id = ? ORDER BY timestamp DESC LIMIT 100", [req.params.id]);
-      res.json(history.reverse());
+      const history = await getRows("SELECT * FROM terminal_history WHERE session_id = ? ORDER BY timestamp ASC LIMIT 100", [req.params.id]);
+      res.json(history);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

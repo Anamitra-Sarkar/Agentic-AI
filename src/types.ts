@@ -22,7 +22,7 @@ export interface Session {
   name: string;
   created_at: number;
   last_modified: number;
-  model_config: any;
+  model_config: Record<string, unknown>;
 }
 
 export interface TerminalEntry {
