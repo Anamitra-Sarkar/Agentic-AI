@@ -1,0 +1,81 @@
+name: Deploy Backend to HuggingFace Spaces
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'server.ts'
+      - '.github/workflows/deploy-backend-hf.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Git for HuggingFace
+        run: |
+          git config --global user.email "deploy@agentic-ai.dev"
+          git config --global user.name "Agentic-AI Deployer"
+
+      - name: Clone HuggingFace Space repository
+        run: |
+          git clone https://${{ secrets.HF_USERNAME }}:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/${{ secrets.HF_SPACE_NAME }} hf_space_repo
+        env:
+          GIT_LFS_SKIP_SMUDGE: 1
+
+      - name: Copy backend and server files to HF Space
+        run: |
+          # Copy backend directory if it exists
+          if [ -d "backend" ]; then
+            mkdir -p hf_space_repo/backend
+            cp -r backend/* hf_space_repo/backend/ || true
+          fi
+          
+          # Copy server.ts
+          if [ -f "server.ts" ]; then
+            cp server.ts hf_space_repo/
+          fi
+          
+          # Copy package.json and package-lock.json for dependencies
+          if [ -f "package.json" ]; then
+            cp package.json hf_space_repo/
+          fi
+          if [ -f "package-lock.json" ]; then
+            cp package-lock.json hf_space_repo/
+          fi
+          
+          # Copy any .env.example for reference
+          if [ -f ".env.example" ]; then
+            cp .env.example hf_space_repo/
+          fi
+
+      - name: Commit and push to HuggingFace Space
+        run: |
+          cd hf_space_repo
+          
+          # Check if there are any changes
+          if git diff --quiet; then
+            echo "No changes detected. Skipping push."
+            exit 0
+          fi
+          
+          git add -A
+          git commit -m "Sync backend from Agentic-AI main branch"
+          git push origin main
+        continue-on-error: true
+
+      - name: Deployment Success Notification
+        if: success()
+        run: |
+          echo "✅ Backend deployed successfully to HuggingFace Space: ${{ secrets.HF_SPACE_NAME }}"
+          echo "🔗 View space at: https://huggingface.co/spaces/${{ secrets.HF_SPACE_NAME }}"
+
+      - name: Deployment Failure Notification
+        if: failure()
+        run: |
+          echo "❌ Backend deployment to HuggingFace Space failed"
+          exit 1

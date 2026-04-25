@@ -1141,7 +1141,7 @@ Return ONLY valid JSON in this exact shape:
 
           if (healingPatch?.tool_calls) {
               for (const call of healingPatch.tool_calls) {
-                  if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
+                  if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger, { autoApproveDiff: true });
               }
           }
       }
@@ -1290,7 +1290,12 @@ Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> 
         // SELF-HEALING: Verify immediately
         logger('Triggering Smart Build Pulse...', 'system');
         const check = await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: 'python3 -m py_compile backend/main.py && npx esbuild frontend/src/App.tsx --bundle --dry-run', workdir: '/' }) } }, logger);
-        const checkStatus = JSON.parse(check);
+        let checkStatus: any;
+        try {
+            checkStatus = JSON.parse(check);
+        } catch (e) {
+            checkStatus = { exit_code: -1, stderr: String(check) };
+        }
         
         if (checkStatus.exit_code !== 0) {
             logger('!! RUNTIME COLLISION: Triggering Rapid Healing...', 'warning');
