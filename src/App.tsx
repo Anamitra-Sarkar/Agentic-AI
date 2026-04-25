@@ -20,6 +20,7 @@ import { TaskRouter, groqTools } from './constants';
 import { cleanCode, waitForOnline, fetchWithRetry } from './utils';
 import { ToastContainer } from './components/ToastContainer';
 import { ConfirmModal } from './components/ConfirmModal';
+import { DiffViewerModal } from './components/DiffViewerModal';
 import { FileTree } from './components/FileTree';
 import { TerminalPanel } from './components/TerminalPanel';
 import { ChatPanel } from './components/ChatPanel';
@@ -61,10 +62,55 @@ export default function App() {
   const chatHistoryRef = useRef<ChatMessage[]>([]);
   // Pending plan confirmation state for grounded edits
   const [pendingPlan, setPendingPlan] = useState<{ title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null>(null);
+  const [pendingDiff, setPendingDiff] = useState<{
+    filePath: string;
+    oldContent: string;
+    newContent: string;
+    onApply: () => void;
+    onReject: () => void;
+  } | null>(null);
   
   const updateProjectFiles = (newFiles: Record<string, string>) => {
     filesSnapshotRef.current = newFiles;
     setProjectFiles(newFiles);
+  };
+
+  const computeUnifiedDiffResult = (patchText: string, sourceFiles: Record<string, string>) => {
+    const patchRegex = /FILE:\s*([^\s\n]+)\n<<<<<<<\s*SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE/g;
+    let match: RegExpExecArray | null;
+    let updatedFiles = { ...sourceFiles };
+    let appliedCount = 0;
+    const collisions: string[] = [];
+    let previewFilePath = '';
+    let previewOldContent = '';
+    let previewNewContent = '';
+
+    while ((match = patchRegex.exec(patchText)) !== null) {
+      const [, filePath, searchContent, replaceContent] = match;
+      if (!previewFilePath) {
+        previewFilePath = filePath;
+        previewOldContent = updatedFiles[filePath] || '';
+      }
+
+      const currentContent = updatedFiles[filePath];
+      if (currentContent !== undefined) {
+        const trimmedSearch = searchContent.trim();
+        if (currentContent.includes(trimmedSearch)) {
+          const nextContent = currentContent.replace(trimmedSearch, replaceContent.trim());
+          updatedFiles[filePath] = nextContent;
+          if (filePath === previewFilePath) previewNewContent = nextContent;
+          appliedCount++;
+        } else {
+          collisions.push(`Unified Diff Collision: Fragment in ${filePath} not found.`);
+        }
+      }
+    }
+
+    if (previewFilePath && !previewNewContent) {
+      previewNewContent = updatedFiles[previewFilePath] || '';
+    }
+
+    return { updatedFiles, appliedCount, previewFilePath, previewOldContent, previewNewContent, collisions };
   };
 
   const [selectedFile, setSelectedFile] = useState<string>('');
@@ -674,27 +720,24 @@ export default function App() {
       }
 
       if (name === 'apply_unified_diff') {
-          const patchText = args.patch_text;
-          const patchRegex = /FILE:\s*([^\s\n]+)\n<<<<<<<\s*SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE/g;
-          let match;
-          let updatedFiles = { ...filesSnapshotRef.current };
-          let appliedCount = 0;
-
-          while ((match = patchRegex.exec(patchText)) !== null) {
-              const [_, filePath, searchContent, replaceContent] = match;
-              const currentContent = updatedFiles[filePath];
-              if (currentContent !== undefined) {
-                  const trimmedSearch = searchContent.trim();
-                  if (currentContent.includes(trimmedSearch)) {
-                      updatedFiles[filePath] = currentContent.replace(trimmedSearch, replaceContent.trim());
-                      appliedCount++;
-                  } else {
-                      log(`Unified Diff Collision: Fragment in ${filePath} not found. (Search target: ${trimmedSearch.substring(0, 20)}...)`, 'warning');
-                  }
+          const { updatedFiles, appliedCount, previewFilePath, previewOldContent, previewNewContent, collisions } = computeUnifiedDiffResult(args.patch_text, filesSnapshotRef.current);
+          collisions.forEach(message => log(message, 'warning'));
+          return new Promise<string>((resolve) => {
+            setPendingDiff({
+              filePath: previewFilePath || 'Unknown file',
+              oldContent: previewOldContent,
+              newContent: previewNewContent,
+              onApply: () => {
+                updateProjectFiles(updatedFiles);
+                setPendingDiff(null);
+                resolve(`// Applied ${appliedCount} surgical unified diffs to codebase.`);
+              },
+              onReject: () => {
+                setPendingDiff(null);
+                resolve('REJECTED — user declined the diff');
               }
-          }
-          updateProjectFiles(updatedFiles);
-          return `// Applied ${appliedCount} surgical unified diffs to codebase.`;
+            });
+          });
       }
       if (name === 'get_preview_url') {
           return `https://huggingface.co/spaces/${args.space_name || 'architect-space'}`;
@@ -918,13 +961,31 @@ Return ONLY valid JSON in this exact shape:
       // PHASE 1: DRAFT (Surgical Logic via Scout)
       logger(`PHASE 1: "The Draft" - Synthesizing full stack ${isClone ? 'clone' : 'logic'}...`, 'system');
       setActiveAgents({ 'Drafting': taskConfig.model });
+
+      const taskForFile = (filePath: string) => {
+        const lower = filePath.toLowerCase();
+        if (
+          lower.endsWith('.py') ||
+          lower.includes('server.ts') ||
+          lower.includes('/backend') ||
+          lower.includes('/api') ||
+          lower.includes('/database') ||
+          lower.endsWith('requirements.txt') ||
+          lower.includes('dockerfile')
+        ) return TaskRouter.backendCore;
+        if (lower.endsWith('.tsx') || lower.endsWith('.jsx') || lower.endsWith('app.tsx') || lower.includes('components')) return TaskRouter.frontendReact;
+        if (lower.endsWith('.css') || lower.includes('index.css') || lower.includes('styles') || lower.includes('tailwind')) return TaskRouter.visualAnalysis;
+        if (lower.includes('architecture') || lower.includes('system design') || lower.includes('readme')) return TaskRouter.architectureDesign;
+        if (lower.endsWith('.sql') || lower.includes('schema') || lower.includes('migrations')) return TaskRouter.sqlGeneration;
+        return TaskRouter.draft;
+      };
       
       const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
-          callAPI(TaskRouter.backendCore, `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
-          callAPI(TaskRouter.frontendReact, `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
-          callAPI(TaskRouter.visualAnalysis, `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
-          callAPI(TaskRouter.dataModeling, `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
-          callAPI(TaskRouter.intermediateLogic, `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
+          callAPI(taskForFile('backend/main.py'), `DRAFT PHASE: Generate pure Python FastAPI code. Define any efficient port. ONLY PURE CODE.${additionalInstruction}`, `Build FastAPI backend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskForFile('frontend/src/App.tsx'), `DRAFT PHASE: Generate React 19 code. API base should dynamically target the backend. ONLY PURE CODE.${additionalInstruction}`, `Build React frontend for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskForFile('frontend/src/index.css'), `DRAFT PHASE: Generate Tailwind @layer CSS for optimized theme.${additionalInstruction}`, `CSS for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskForFile('backend/requirements.txt'), `DRAFT PHASE: Generate backend/requirements.txt. Include any required dependencies (beta/nightly allowed).${additionalInstruction}`, `Requirements for: ${rectifiedPrompt}`, false, logger),
+          callAPI(taskForFile('Dockerfile'), `DRAFT PHASE: Generate Dockerfile. Expose appropriate ports. ONLY PURE CODE.${additionalInstruction}`, `Dockerfile for: ${rectifiedPrompt}`, false, logger)
       ]);
 
       const initialFiles = {
@@ -1121,12 +1182,6 @@ Return ONLY valid JSON in this exact shape:
     const entryFiles = { ...filesSnapshotRef.current };
     const soulContent = entryFiles['SOUL.md'] || '';
 
-    // INTENT PREDICTION: Pre-Flight Scan
-    if (userMsg.toLowerCase().includes('backend') || userMsg.toLowerCase().includes('api')) {
-        logger('Intent Prediction: Scanning Backend environment...', 'system');
-        await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: 'ls -R backend', workdir: '/' }) } }, logger);
-    }
-
     // Intent Detection — route to specialist model
     const intentRes = await callAPI(
       TaskRouter.clarifier,
@@ -1144,22 +1199,27 @@ Return ONLY valid JSON in this exact shape:
       'styling':      TaskRouter.visualAnalysis,
     };
     const selectedTask = taskForIntent[intent] ?? TaskRouter.draft;
-    logger(`Intent: "${intent}" → Routing to ${selectedTask.model}`, 'system');
+    logger(`🧠 Intent: "${intent}" → Routing to ${selectedTask.model}`, 'system');
+
+    // INTENT PREDICTION: Pre-Flight Scan
+    if (userMsg.toLowerCase().includes('backend') || userMsg.toLowerCase().includes('api')) {
+        logger('Intent Prediction: Scanning Backend environment...', 'system');
+        await executeToolCall({ function: { name: 'terminal_run', arguments: JSON.stringify({ command: 'ls -R backend', workdir: '/' }) } }, logger);
+    }
 
     // PHASE 1: DRAFT PATCH (Surgical)
     logger('COMMENCING DELTA-FIRST PATCH: Drafting surgical unified diff...', 'system');
     setActiveAgents({ 'Engineer': selectedTask.model });
 
     const draftPatch = await callAPI(selectedTask,
-        `STRICT GROUNDED EDIT PROTOCOL — You are the Senior Engineer.
-MANDATORY SEQUENCE — you MUST follow this order or the edit will be rejected:
-1. Call fs_search to locate the relevant code section
-2. Call fs_read_lines to read the exact lines before touching them
-3. Call plan_and_confirm with your complete numbered edit plan
+        `STRICT GROUNDED EDIT PROTOCOL:
+1. ALWAYS call fs_search first to locate relevant code
+2. ALWAYS call fs_read_lines on the exact lines before editing
+3. ALWAYS call plan_and_confirm with your full numbered plan BEFORE any edits
 4. ONLY after plan is approved: call apply_unified_diff
-You are FORBIDDEN from calling apply_unified_diff without first calling plan_and_confirm.
+5. You are FORBIDDEN from calling apply_unified_diff without plan_and_confirm first
 Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> REPLACE
-SOUL context: ${soulContent}`,
+        SOUL context: ${soulContent}`,
         `Modification Task: ${userMsg}
         --- 
         CURRENT CODEBASE:
@@ -1387,334 +1447,47 @@ SOUL context: ${soulContent}`,
 
   if (view === 'landing') {
     return (
-      <div className="min-h-screen bg-[#f7f6f2] text-[#2d2d2d] flex flex-col md:flex-row font-sans">
-        {statusOverlays}
-        {/* Session Sidebar */}
-        <div className="w-full md:w-80 bg-[#f9f8f5] border-r border-alpha p-8 flex flex-col shadow-warm">
-           <div className="flex justify-between items-center mb-10">
-              <h2 className="text-xl font-bold flex items-center gap-2 font-display">
-                <Layers className="w-5 h-5 text-[#01696f]" /> Projects
-              </h2>
-              <button 
-                onClick={() => createSession()}
-                className="p-2 hover:bg-[#efebe3] rounded-[8px] premium-transition border border-transparent hover:border-alpha"
-              >
-                <Sparkles className="w-4 h-4 text-[#01696f]" />
-              </button>
-           </div>
-           
-           <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3">
-              {sessions.length === 0 && (
-                <div className="py-12 px-4 text-center border-2 border-dashed border-alpha rounded-[12px] opacity-40">
-                   <p className="text-xs font-bold uppercase tracking-widest leading-loose">No active clusters found</p>
-                </div>
-              )}
-              {sessions.map(s => (
-                <div 
-                  key={s.id}
-                  onClick={() => loadSession(s)}
-                  className="p-4 bg-[#f7f6f2] border border-alpha rounded-[12px] cursor-pointer premium-transition hover:translate-x-1 hover:border-[#01696f]/30 group"
-                >
-                  <div className="flex justify-between items-start mb-2">
-                    <h4 className="font-bold text-[13px] truncate pr-2 group-hover:text-[#01696f] premium-transition">{s.name}</h4>
-                    <span className="text-[9px] font-bold text-[#6b6b6b] opacity-40 uppercase tracking-tighter">
-                      {new Date(s.last_modified).toLocaleDateString()}
-                    </span>
-                  </div>
-                  <div className="text-[10px] text-[#6b6b6b] font-medium opacity-60">
-                    Sovereign Runtime Cluster
-                  </div>
-                </div>
-              ))}
-           </div>
-
-           <div className="mt-8 pt-8 border-t border-alpha">
-              <div className="p-4 bg-[#01696f]/5 rounded-[12px] border border-[#01696f]/10">
-                 <p className="text-[10px] font-bold text-[#01696f] uppercase tracking-widest mb-1">State Integrity</p>
-                 <p className="text-[10px] text-[#01696f]/60 font-medium leading-relaxed">SQLite persistence actively caching agentic state trees across session cycles.</p>
-              </div>
-           </div>
-        </div>
-
-        {/* Main Content */}
-        <div className="flex-1 relative overflow-y-auto custom-scrollbar pb-64">
-           <nav className="p-8 flex justify-between items-center sticky top-0 bg-[#f7f6f2]/80 backdrop-blur-[12px] z-20 border-b border-alpha transition-all duration-300">
-              <h1 className="text-2xl font-bold tracking-tight cursor-pointer flex items-center gap-3 font-display" onClick={startNewProject}>
-                <Box className="w-6 h-6 text-[#01696f]" />
-                AI Architect
-              </h1>
-              <div className="flex gap-4 items-center">
-                <div className="flex items-center gap-3">
-                  <img src={user.photoURL || `https://api.dicebear.com/9.x/thumbs/svg?seed=${encodeURIComponent(user.displayName || user.email || user.uid)}`} alt={user.displayName || 'User'} className="w-8 h-8 rounded-full object-cover border border-alpha" />
-                  <span className="text-sm font-bold max-w-32 truncate">{user.displayName || user.email || 'Signed in'}</span>
-                </div>
-                <button onClick={() => {
-                  confirmAction({
-                    title: 'Fast-Track Manifest?',
-                    description: 'This will spawn a clean session container immediately without pre-rectification logic. Continue?',
-                    confirmLabel: 'Spawn Container',
-                   onConfirm: async () => {
-                      const ns = await createSession("New Sovereign Node");
-                      if (ns) loadSession(ns);
-                   }
-                 })
-              }} className="text-sm font-bold px-6 py-2.5 bg-[#f9f8f5] border border-alpha hover:bg-[#efebe3] shadow-warm rounded-[8px] premium-transition">New Project</button>
-            </div>
-          </nav>
-
-          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="max-w-4xl mx-auto text-left py-24 px-8">
-            <motion.h2 initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} className="text-6xl sm:text-7xl font-bold mb-10 tracking-tight text-[#2d2d2d] font-display">
-              Build, <span className="text-[#01696f]">Intelligently.</span>
-            </motion.h2>
-            <p className="text-xl text-[#6b6b6b] mb-20 max-w-2xl leading-relaxed font-medium">
-              Harness multi-model distribution. Route infrastructure generation to NVIDIA NIM and edge UI creation to OpenRouter with seamless state orchestration.
-            </p>
-            
-            <div className="bg-[#f9f8f5] p-12 rounded-[12px] shadow-warm border border-alpha mb-16 text-left relative overflow-hidden group premium-transition hover:shadow-lg stagger-fade-in">
-              <div className="absolute top-0 right-0 p-12 opacity-[0.03] group-hover:opacity-[0.06] premium-transition">
-                  <Layers className="w-64 h-64" />
-              </div>
-              <h3 className="font-bold text-3xl mb-6 text-[#2d2d2d] relative z-10 font-display">Elastic Full-Stack Orchestration</h3>
-              <p className="text-[#6b6b6b] text-lg leading-relaxed relative z-10 max-w-2xl mb-10 font-medium">
-                AI Architect synthesizes your prompt into distinct, sovereign modules. It concurrently builds backends, frontends, and logic matrices, granting you the freedom to deploy anywhere—from serverless edges to dedicated clusters.
-              </p>
-              <div className="flex flex-wrap gap-4 relative z-10">
-                  <div className="px-5 py-2.5 bg-[#f7f6f2] rounded-full border border-alpha text-[11px] font-bold text-[#6b6b6b] uppercase tracking-[0.1em] flex items-center gap-2.5">
-                      <Box className="w-4 h-4" /> Multi-Runtime Support
-                  </div>
-                  <div className="px-5 py-2.5 bg-[#f7f6f2] rounded-full border border-alpha text-[11px] font-bold text-[#6b6b6b] uppercase tracking-[0.1em] flex items-center gap-2.5">
-                      <Globe className="w-4 h-4" /> Infinite Deployment Targets
-                  </div>
-              </div>
-            </div>
-          </motion.div>
-
-          <div className="absolute bottom-0 left-0 w-full p-8 bg-gradient-to-t from-[#f7f6f2] via-[#f7f6f2]/95 to-transparent z-40">
-            <motion.div layout className="max-w-4xl mx-auto bg-[#f9f8f5] p-8 rounded-[12px] shadow-[0_20px_50px_rgba(0,0,0,0.06)] border border-alpha flex flex-col gap-6 relative stagger-fade-in" style={{ animationDelay: '150ms' }}>
-              <div className="absolute -top-4 left-10 px-5 py-1.5 bg-[#01696f] text-white text-[11px] font-bold uppercase tracking-[0.15em] rounded-full shadow-lg">
-                  Vibe Control Center
-              </div>
-              {status === 'idle' && (
-                <div className="flex flex-col gap-6 w-full">
-                  {!isUrlMode ? (
-                    <>
-                      <textarea
-                        className="flex-1 w-full p-6 bg-[#f7f6f2] border border-alpha rounded-[8px] focus:ring-2 focus:ring-[#01696f]/20 focus:border-[#01696f] focus:outline-none resize-none transition-all placeholder:text-[#6b6b6b]/50 text-sm font-medium"
-                        placeholder="Describe your next massive project..."
-                        value={prompt}
-                        onChange={(e) => setPrompt(e.target.value)}
-                        rows={3}
-                      />
-                      <div className="flex justify-between items-center">
-                        <button 
-                          onClick={() => setIsUrlMode(true)}
-                          className="text-[10px] font-bold text-[#6b6b6b] hover:text-[#01696f] uppercase tracking-widest premium-transition"
-                        >
-                          Or clone from URL
-                        </button>
-                        <motion.button 
-                          whileHover={{ scale: 1.01 }}
-                          whileTap={{ scale: 0.98 }}
-                          onClick={async () => {
-                              const ns = await createSession(prompt.substring(0, 30) || "Dynamic Venture");
-                              if (ns) {
-                                  setActiveSession(ns);
-                                  askClarifications(prompt);
-                              }
-                          }}
-                          disabled={!prompt.trim()}
-                          className="px-12 py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-xl shadow-[#01696f]/20 premium-transition hover:translate-y-[-2px] active:scale-95 disabled:opacity-50 disabled:translate-y-0 flex items-center gap-3"
-                        >
-                          <SparklesIcon />
-                          Initiate Build
-                        </motion.button>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="space-y-6">
-                      <div className="flex flex-col sm:flex-row gap-4">
-                        <div className="flex-1 relative">
-                          <Globe className="absolute left-6 top-1/2 -translate-y-1/2 w-4 h-4 text-[#01696f]" />
-                          <input 
-                            type="text"
-                            placeholder="https://example.com — paste any website"
-                            className="w-full pl-14 pr-6 py-4 bg-[#f7f6f2] border border-alpha rounded-[8px] focus:ring-2 focus:ring-[#01696f]/20 focus:border-[#01696f] focus:outline-none text-sm font-medium"
-                            value={cloneUrl}
-                            onChange={(e) => setCloneUrl(e.target.value)}
-                          />
-                        </div>
-                        <button 
-                          onClick={handleCloneFromUrl}
-                          disabled={isAnalyzing || !cloneUrl.trim()}
-                          className="px-10 py-4 bg-[#01696f] text-white font-bold rounded-[8px] shadow-xl shadow-[#01696f]/20 premium-transition hover:translate-y-[-2px] active:scale-95 disabled:opacity-50 flex items-center justify-center gap-3 whitespace-nowrap min-w-[220px]"
-                        >
-                          {isAnalyzing ? <RefreshCcw className="w-4 h-4 animate-spin" /> : <Globe className="w-4 h-4" />}
-                          Analyze & Clone
-                        </button>
-                      </div>
-                      
-                      {isAnalyzing && (
-                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 animate-in fade-in slide-in-from-bottom-2">
-                          {[
-                            "Scraping layout structure...",
-                            "Extracting color palette...",
-                            "Mapping component hierarchy...",
-                            "Synthesizing clone specification..."
-                          ].map((step, i) => (
-                            <div key={i} className={`flex items-center gap-3 p-4 rounded-[8px] border premium-transition ${cloneProgress > i ? 'bg-[#01696f]/5 border-[#01696f]/20 opacity-100' : 'bg-transparent border-alpha opacity-30'}`}>
-                              {cloneProgress > i ? <Check className="w-3.5 h-3.5 text-[#01696f]" /> : <div className="w-3.5 h-3.5 rounded-full border border-current" />}
-                              <span className="text-[10px] font-bold uppercase tracking-tight truncate">{step}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      <button 
-                        onClick={() => { setIsUrlMode(false); setIsAnalyzing(false); setCloneProgress(0); }}
-                        className="text-[10px] font-bold text-[#6b6b6b] hover:text-[#01696f] uppercase tracking-widest premium-transition mt-2"
-                      >
-                        ← Back to standard prompt
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-              
-              {status === 'clarifying' && isClarifying && (
-                <div className="py-12 text-[#01696f] w-full text-center font-bold flex items-center justify-center gap-4 text-lg">
-                  <RefreshCcw className="w-6 h-6 animate-spin" />
-                  <span className="shimmer bg-clip-text text-transparent uppercase tracking-widest text-sm">
-                    Analyzing requirements...
-                  </span>
-                </div>
-              )}
-
-              {clarifications.length > 0 && (
-                <motion.div 
-                  initial={{ opacity: 0, y: 20 }} 
-                  animate={{ opacity: 1, y: 0 }}
-                  className="w-full space-y-6 stagger-fade-in"
-                >
-                  <div className="flex items-center gap-3 mb-2">
-                    <div className="w-8 h-8 rounded-full bg-[#01696f15] flex items-center justify-center">
-                      <Bot className="w-4 h-4 text-[#01696f]" />
-                    </div>
-                    <div>
-                      <p className="font-bold text-[#2d2d2d] text-sm">Pre-Flight Check</p>
-                      <p className="text-[10px] text-[#6b6b6b] uppercase tracking-widest font-bold">
-                        {clarifications.length} question{clarifications.length > 1 ? 's' : ''} to optimize your build
-                      </p>
-                    </div>
-                  </div>
-
-                  {clarifications.map((q, idx) => (
-                    <motion.div
-                      key={q.id}
-                      initial={{ opacity: 0, y: 12 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ delay: idx * 0.1 }}
-                      className="bg-[#f9f8f5] border border-alpha rounded-[12px] p-6"
-                    >
-                      <p className="font-bold text-[#2d2d2d] text-sm mb-4 flex items-start gap-2">
-                        <span className="text-[#01696f] font-black">{idx + 1}.</span>
-                        {q.question}
-                      </p>
-
-                      {q.type === 'yesno' && (
-                        <div className="flex gap-3">
-                          {['Yes', 'No'].map(opt => (
-                            <button
-                              key={opt}
-                              onClick={() => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: opt } : cq))}
-                              className={`flex-1 py-3 rounded-[8px] text-sm font-bold border premium-transition
-                                ${q.answer === opt 
-                                  ? 'bg-[#01696f] text-white border-[#01696f] shadow-lg shadow-[#01696f15]' 
-                                  : 'bg-[#f7f6f2] text-[#2d2d2d] border-alpha hover:border-[#01696f30] hover:bg-[#f3f0ec]'
-                                }`}
-                            >
-                              {opt === 'Yes' ? '✓ Yes' : '✗ No'}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-
-                      {q.type === 'choice' && (
-                        <div className="flex flex-wrap gap-2">
-                          {(q.options || []).map(opt => (
-                            <button
-                              key={opt}
-                              onClick={() => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: opt } : cq))}
-                              className={`px-4 py-2 rounded-full text-xs font-bold border premium-transition
-                                ${q.answer === opt
-                                  ? 'bg-[#01696f] text-white border-[#01696f] shadow-md'
-                                  : 'bg-[#f7f6f2] text-[#6b6b6b] border-alpha hover:border-[#01696f30] hover:text-[#2d2d2d]'
-                                }`}
-                            >
-                              {opt}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-
-                      {q.type === 'text' && (
-                        <input
-                          type="text"
-                          placeholder="Type your answer..."
-                          value={q.answer || ''}
-                          onChange={e => setClarifications(prev => prev.map(cq => cq.id === q.id ? { ...cq, answer: e.target.value } : cq))}
-                          className="w-full px-4 py-3 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm font-medium focus:ring-2 focus:ring-[#01696f20] focus:border-[#01696f] focus:outline-none premium-transition"
-                        />
-                      )}
-                    </motion.div>
-                  ))}
-
-                  <div className="flex gap-4">
-                    <motion.button
-                      whileHover={{ scale: 1.01 }}
-                      whileTap={{ scale: 0.98 }}
-                      onClick={submitClarifications}
-                      className="flex-1 py-4 bg-[#01696f] text-white rounded-[8px] font-bold shadow-xl shadow-[#01696f10] premium-transition"
-                    >
-                      Confirm & Build →
-                    </motion.button>
-                    <button
-                      onClick={() => { setClarifications([]); rectifyPrompt(prompt); }}
-                      className="px-8 py-4 bg-[#efebe3] text-[#2d2d2d] rounded-[8px] font-bold border border-alpha premium-transition hover:bg-[#e8e4dc]"
-                    >
-                      Skip — use defaults
-                    </button>
-                  </div>
-                </motion.div>
-              )}
-
-              {status === 'rectifying' && <div className="py-12 text-[#01696f] w-full text-center font-bold flex items-center justify-center gap-4 text-lg">
-                <RefreshCcw className="w-6 h-6 animate-spin" /> 
-                <span className="shimmer bg-clip-text text-transparent uppercase tracking-widest text-sm">Compressing requirements via Swarm Matrix...</span>
-              </div>}
-              
-              {status === 'prompt-review' && (
-                <div className="w-full space-y-8 stagger-fade-in">
-                  <div className="bg-[#2d2d2d] p-8 rounded-[12px] text-[#efebe3] leading-relaxed border border-alpha max-h-72 overflow-y-auto font-mono text-[13px] shadow-inner custom-scrollbar relative">
-                      <span className="text-[#6b6b6b] block mb-4 font-bold uppercase tracking-[0.2em] text-[10px]">Verified Spec:</span>
-                      {rectifiedPrompt}
-                      <div className="absolute bottom-4 right-4 text-[#01696f] opacity-50"><CheckCircle2 className="w-6 h-6" /></div>
-                  </div>
-                  <div className="flex flex-wrap gap-6">
-                    <motion.button whileHover={{ scale: 1.01 }} whileTap={{ scale: 0.98 }} className="flex-1 min-w-[240px] py-6 bg-[#01696f] text-white rounded-[8px] transition font-bold shadow-xl shadow-[#01696f]/10" onClick={handleApproveAndBuild}>Approve & Spark Microservices</motion.button>
-                    <motion.button whileHover={{ scale: 1.01 }} whileTap={{ scale: 0.98 }} className="px-12 py-6 bg-[#efebe3] text-[#2d2d2d] rounded-[8px] transition font-bold border border-alpha" onClick={() => setStatus('idle')}>Discard</motion.button>
-                  </div>
-                </div>
-              )}
-            </motion.div>
-          </div>
-        </div>
-      </div>
+      <LandingView
+        prompt={prompt}
+        setPrompt={setPrompt}
+        cloneUrl={cloneUrl}
+        setCloneUrl={setCloneUrl}
+        isUrlMode={isUrlMode}
+        setIsUrlMode={setIsUrlMode}
+        clarifications={clarifications}
+        setClarifications={setClarifications}
+        status={status}
+        isClarifying={isClarifying}
+        isAnalyzing={isAnalyzing}
+        cloneProgress={cloneProgress}
+        handleCloneFromUrl={handleCloneFromUrl}
+        askClarifications={askClarifications}
+        submitClarifications={submitClarifications}
+        sessions={sessions}
+        loadSession={loadSession}
+        createSession={createSession}
+        user={user}
+        signInWithGoogle={signInWithGoogle}
+        signInWithGithub={signInWithGithub}
+        logout={logout}
+        authLoading={authLoading}
+        setStatus={setStatus}
+        rectifiedPrompt={rectifiedPrompt}
+        handleApproveAndBuild={handleApproveAndBuild}
+        startNewProject={startNewProject}
+        onScreenshotBuild={(nextPrompt) => {
+          setPrompt(nextPrompt);
+          setRectifiedPrompt(nextPrompt);
+          handleApproveAndBuild();
+        }}
+      />
     );
   }
 
   return (
     <div className="min-h-screen bg-[#f7f6f2] flex p-6 gap-6 max-h-screen overflow-hidden font-sans">
       {statusOverlays}
+      {pendingDiff && <DiffViewerModal {...pendingDiff} />}
       {/* Sidebar: Chat */}
       <ChatPanel
         chatHistory={chatHistory}

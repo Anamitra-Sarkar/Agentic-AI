@@ -1,6 +1,6 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { RefreshCcw, List, Send, Check, X } from 'lucide-react';
+import { RefreshCcw, List, Send, Check, X, Mic, MicOff } from 'lucide-react';
 import type { ChatMessage, QueuedInstruction, TerminalEntry } from '../types';
 
 import { PlanConfirmCard } from './PlanConfirmCard';
@@ -19,8 +19,58 @@ export const ChatPanel: React.FC<{
   pendingPlan?: { title: string; steps: string[]; onApprove: () => void; onReject: () => void } | null;
   setPendingPlan?: (p: any) => void;
 }> = ({ chatHistory, followUp, setFollowUp, isGenerating, sendFollowUpDirect, queueInput, setQueueInput, instructionQueue, addToQueue, chatEndRef, pendingPlan, setPendingPlan }) => {
+  const [isRecording, setIsRecording] = React.useState(false);
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const audioChunksRef = React.useRef<Blob[]>([]);
+
+  const handleVoiceInput = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const formData = new FormData();
+        formData.append('audio', audioBlob, 'audio.webm');
+        try {
+          const res = await fetch('/api/voice/transcribe', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (data.text) {
+            setFollowUp(prev => prev + (prev ? ' ' : '') + data.text);
+          }
+        } catch (err) {
+          console.error('Transcription failed', err);
+        }
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+      setTimeout(() => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop();
+          setIsRecording(false);
+        }
+      }, 30000);
+    } catch (err) {
+      console.error('Microphone access denied', err);
+    }
+  };
+
   return (
     <div className="flex-1 bg-white rounded-[12px] border border-alpha shadow-2xl overflow-hidden flex flex-col">
+      <style>{`@keyframes micPulse { 0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(229,83,75,0.35); } 50% { transform: scale(1.04); box-shadow: 0 0 0 10px rgba(229,83,75,0); } }`}</style>
       <div className="p-6 overflow-y-auto custom-scrollbar space-y-4" style={{ maxHeight: '60vh' }}>
         {/* Plan confirmation card (if any) */}
         {pendingPlan && <PlanConfirmCard title={pendingPlan.title} steps={pendingPlan.steps} onApprove={() => { pendingPlan.onApprove(); setPendingPlan(null); }} onReject={() => { pendingPlan.onReject(); setPendingPlan(null); }} /> }
@@ -56,9 +106,22 @@ export const ChatPanel: React.FC<{
               }
             }}
             placeholder={isGenerating ? "Queue next instruction — agent will execute after current task..." : "Instruct Copilot..."}
-            className="w-full p-6 pr-16 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm focus:ring-2 focus:ring-[#01696f]/10 focus:border-[#01696f] focus:outline-none resize-none shadow-inner transition-all placeholder:text-[#6b6b6b]/40 font-medium"
+            className="w-full p-6 pl-16 pr-16 bg-[#f7f6f2] border border-alpha rounded-[8px] text-sm focus:ring-2 focus:ring-[#01696f]/10 focus:border-[#01696f] focus:outline-none resize-none shadow-inner transition-all placeholder:text-[#6b6b6b]/40 font-medium"
             rows={2}
           />
+          <button
+            type="button"
+            title={isRecording ? 'Recording... click to stop' : 'Click to speak'}
+            onClick={handleVoiceInput}
+            className="absolute left-4 bottom-4 rounded-full w-10 h-10 flex items-center justify-center border border-alpha shadow-sm"
+            style={{
+              background: isRecording ? '#e5534b' : 'transparent',
+              color: isRecording ? '#fff' : '#01696f',
+              animation: isRecording ? 'micPulse 1.2s ease-in-out infinite' : undefined,
+            }}
+          >
+            {isRecording ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+          </button>
           <button 
             onClick={() => {
               if (!followUp.trim()) return;

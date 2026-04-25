@@ -7,6 +7,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createClient } from "@libsql/client";
 import { v4 as uuidv4 } from "uuid";
+import multer from "multer";
+import FormData from "form-data";
+import { Readable } from "stream";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,38 +91,39 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true }));
   app.use("/api/sessions", (req, _res, next) => {
     req.userId = req.header("X-User-Id") || undefined;
     next();
   });
 
   // --- RATE LIMITER ---
-  const rateLimitMap = new Map<string, { count: number; lastReset: number }>();
-  const RATE_LIMIT_WINDOW = 60000; // 1 minute
+  const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  const RATE_LIMIT_WINDOW = 60000;
   const MAX_REQUESTS = 60;
 
   const rateLimiter = (req: any, res: any, next: any) => {
     const ip = req.ip || req.connection.remoteAddress || 'unknown';
     const now = Date.now();
-    const limitData = rateLimitMap.get(ip) || { count: 0, lastReset: now };
+    const limitData = rateLimitMap.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
 
-    if (now - limitData.lastReset > RATE_LIMIT_WINDOW) {
-      limitData.count = 1;
-      limitData.lastReset = now;
+    if (now >= limitData.resetAt) {
+      limitData.count = 0;
+      limitData.resetAt = now + RATE_LIMIT_WINDOW;
     } else {
-      limitData.count++;
+      limitData.count += 1;
     }
 
     rateLimitMap.set(ip, limitData);
 
     if (limitData.count > MAX_REQUESTS) {
-      return res.status(429).json({ error: "Rate limit exceeded. Max 60 requests per minute." });
+      return res.status(429).json({ error: "Rate limit exceeded. Try again in a minute." });
     }
     next();
   };
 
   // --- PROXY ENDPOINTS ---
-  const proxyRequest = async (url: string, key: string | undefined, body: any, extraHeaders = {}) => {
+  const proxyRequest = async (url: string, key: string | undefined, body: any, extraHeaders: Record<string, string> = {}) => {
     if (!key) throw new Error("API Key not configured on server.");
     const res = await fetch(url, {
       method: "POST",
@@ -142,6 +146,28 @@ async function startServer() {
 
   app.post("/api/proxy/groq", rateLimiter, async (req, res) => {
     try {
+      const { stream, ...payload } = req.body || {};
+      if (stream) {
+        if (!process.env.GROQ_API_KEY) throw new Error("API Key not configured on server.");
+        const upstream = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+          },
+          body: JSON.stringify({ ...payload, stream: true })
+        });
+        if (!upstream.ok || !upstream.body) {
+          const errorText = await upstream.text();
+          return res.status(upstream.status || 500).json({ error: errorText || upstream.statusText });
+        }
+        res.status(upstream.status);
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        Readable.fromWeb(upstream.body as any).pipe(res);
+        return;
+      }
       const data = await proxyRequest("https://api.groq.com/openai/v1/chat/completions", process.env.GROQ_API_KEY, req.body);
       res.json(data);
     } catch (err: any) {
@@ -152,8 +178,8 @@ async function startServer() {
   app.post("/api/proxy/openrouter", rateLimiter, async (req, res) => {
     try {
       const data = await proxyRequest("https://openrouter.ai/api/v1/chat/completions", process.env.OPENROUTER_API_KEY, req.body, {
-        "HTTP-Referer": "https://ai-architect.demo",
-        "X-Title": "AI Architect"
+        "HTTP-Referer": "http://localhost:5173",
+        "X-Title": "Agentic-AI"
       });
       res.json(data);
     } catch (err: any) {
@@ -167,6 +193,46 @@ async function startServer() {
       res.json(data);
     } catch (err: any) {
       res.status(err.status || 500).json({ error: err.message, body: err.body });
+    }
+  });
+
+  const upload = multer({ storage: multer.memoryStorage() });
+  app.post("/api/voice/transcribe", rateLimiter, upload.single("audio"), async (req, res) => {
+    try {
+      if (!process.env.GROQ_API_KEY) {
+        return res.status(500).json({ error: "API Key not configured on server." });
+      }
+      const file = (req as any).file;
+      if (!file?.buffer) {
+        return res.status(400).json({ error: "Missing audio file." });
+      }
+
+      const form = new FormData();
+      form.append("model", "whisper-large-v3-turbo");
+      form.append("response_format", "json");
+      form.append("file", file.buffer, {
+        filename: "audio.webm",
+        contentType: file.mimetype || "audio/webm",
+      });
+
+      const upstream = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+          ...form.getHeaders(),
+        },
+        body: form.getBuffer() as any,
+      });
+
+      if (!upstream.ok) {
+        const errorText = await upstream.text();
+        return res.status(500).json({ error: errorText || upstream.statusText });
+      }
+
+      const data = await upstream.json();
+      return res.json({ text: data.text || "" });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || "Transcription failed" });
     }
   });
 
