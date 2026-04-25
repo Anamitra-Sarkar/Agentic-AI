@@ -25,7 +25,7 @@ export const TaskRouter = {
   docGeneration:       { provider: 'openrouter' as const, model: 'z-ai/glm-4.5-air:free' },
   frontendReact:       { provider: 'openrouter' as const, model: 'nvidia/nemotron-3-super-120b-a12b:free',  fallback: { provider: 'groq' as const, model: 'meta-llama/llama-4-scout-17b-16e-instruct' } },
   apiInterfaces:       { provider: 'openrouter' as const, model: 'google/gemma-4-31b-it:free',              fallback: { provider: 'groq' as const, model: 'llama-3.3-70b-versatile' } },
-  edgeCasesDocs:       { provider: 'openrouter' as const, model: 'openai/gpt-oss-120b:free',               fallback: { provider: 'groq' as const, model: 'openai/gpt-oss-120b' } },
+  edgeCasesDocs:       { provider: 'openrouter' as const, model: 'openai/gpt-oss-120b:free',               fallback: { provider: 'groq' as const, model: 'llama-3.3-70b-versatile' } },
   architectureDesign:  { provider: 'openrouter' as const, model: 'deepseek/deepseek-v3:free',              fallback: { provider: 'nvidia' as const, model: 'deepseek/deepseek-v3.2' } },
   bugAnalysis:         { provider: 'openrouter' as const, model: 'deepseek/deepseek-v3:free',              fallback: { provider: 'nvidia' as const, model: 'deepseek/deepseek-v3.2' } },
   i18nLocalization:    { provider: 'openrouter' as const, model: 'qwen/qwen3-30b-a3b:free' },

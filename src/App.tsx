@@ -503,6 +503,7 @@ export default function App() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullOutput = '';
+      let exitCode: number | null = null;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -522,6 +523,7 @@ export default function App() {
                   e.id === entryId ? { ...e, output: fullOutput } : e
                 ));
               } else if (data.type === 'exit') {
+                exitCode = typeof data.code === 'number' ? data.code : -1;
                 setTerminalEntries(prev => prev.map(e => 
                   e.id === entryId ? { ...e, status: data.code === 0 ? 'success' : 'error' } : e
                 ));
@@ -557,10 +559,14 @@ export default function App() {
           }
         }
       }
-      return JSON.stringify({ status: 'complete' });
+      return JSON.stringify({
+        status: exitCode === 0 ? 'complete' : 'error',
+        exit_code: exitCode ?? -1,
+        stdout: fullOutput
+      });
     } catch (e: any) {
       setTerminalEntries(prev => prev.map(e => e.id === entryId ? { ...e, status: 'error', output: e.output + `\nExecution Error: ${e.message}` } : e));
-      return JSON.stringify({ error: e.message });
+      return JSON.stringify({ error: e.message, exit_code: -1 });
     }
   };
 
@@ -612,7 +618,8 @@ export default function App() {
         const data = await attemptFetch(task.provider, task.model);
         return data.choices?.[0]?.message;
     } catch (err: any) {
-        if (err.message.includes('HTTP429') || err.message.includes('HTTP503') || err.message.includes('timeout')) {
+        const statusCode = Number((err as any)?.status) || Number(err.message.match(/\b(401|403|404|429|503)\b/)?.[1] || 0);
+        if (statusCode === 401 || statusCode === 403 || statusCode === 404 || statusCode === 429 || statusCode === 503 || err.message.includes('timeout')) {
             if ('fallback' in task && task.fallback) {
                 if (logger) logger(`${task.provider === 'openrouter' ? 'OpenRouter' : 'NVIDIA'} ${err.message.replace('HTTP', '')} -> Fallback: Groq ${task.fallback.model}`, 'warning');
                 try {
@@ -627,7 +634,7 @@ export default function App() {
     }
   };
 
-  const executeToolCall = async (toolCall: any, log: (msg: string, role: ChatMessage['role']) => void) => {
+  const executeToolCall = async (toolCall: any, log: (msg: string, role: ChatMessage['role']) => void, options?: { autoApproveDiff?: boolean }) => {
       const name = toolCall.function.name;
       const args = JSON.parse(toolCall.function.arguments);
       log(`Execution Triggered: ${name}(${JSON.stringify(args)})`, 'tool');
@@ -722,6 +729,10 @@ export default function App() {
       if (name === 'apply_unified_diff') {
           const { updatedFiles, appliedCount, previewFilePath, previewOldContent, previewNewContent, collisions } = computeUnifiedDiffResult(args.patch_text, filesSnapshotRef.current);
           collisions.forEach(message => log(message, 'warning'));
+          if (options?.autoApproveDiff) {
+            updateProjectFiles(updatedFiles);
+            return `// Applied ${appliedCount} surgical unified diffs to codebase.`;
+          }
           return new Promise<string>((resolve) => {
             setPendingDiff({
               filePath: previewFilePath || 'Unknown file',
@@ -964,6 +975,7 @@ Return ONLY valid JSON in this exact shape:
 
       const taskForFile = (filePath: string) => {
         const lower = filePath.toLowerCase();
+        let task: typeof TaskRouter[keyof typeof TaskRouter] = TaskRouter.draft;
         if (
           lower.endsWith('.py') ||
           lower.includes('server.ts') ||
@@ -972,12 +984,17 @@ Return ONLY valid JSON in this exact shape:
           lower.includes('/database') ||
           lower.endsWith('requirements.txt') ||
           lower.includes('dockerfile')
-        ) return TaskRouter.backendCore;
-        if (lower.endsWith('.tsx') || lower.endsWith('.jsx') || lower.endsWith('app.tsx') || lower.includes('components')) return TaskRouter.frontendReact;
-        if (lower.endsWith('.css') || lower.includes('index.css') || lower.includes('styles') || lower.includes('tailwind')) return TaskRouter.visualAnalysis;
-        if (lower.includes('architecture') || lower.includes('system design') || lower.includes('readme')) return TaskRouter.architectureDesign;
-        if (lower.endsWith('.sql') || lower.includes('schema') || lower.includes('migrations')) return TaskRouter.sqlGeneration;
-        return TaskRouter.draft;
+        ) task = TaskRouter.backendCore;
+        else if (lower.endsWith('.tsx') || lower.endsWith('.jsx') || lower.endsWith('app.tsx') || lower.includes('components')) task = TaskRouter.frontendReact;
+        else if (lower.endsWith('.css') || lower.includes('index.css') || lower.includes('styles') || lower.includes('tailwind')) task = TaskRouter.visualAnalysis;
+        else if (lower.includes('architecture') || lower.includes('system design') || lower.includes('readme')) task = TaskRouter.architectureDesign;
+        else if (lower.endsWith('.sql') || lower.includes('schema') || lower.includes('migrations')) task = TaskRouter.sqlGeneration;
+        if (task === TaskRouter.draft) {
+          logger(`⚠️ Draft routing fallback for ${filePath} → ${task.model}`, 'warning');
+        } else {
+          logger(`📦 Draft routing: ${filePath} → ${task.model}`, 'system');
+        }
+        return task;
       };
       
       const [backendRes, frontendRes, cssRes, reqsRes, dockerRes] = await Promise.all([
@@ -1244,7 +1261,7 @@ Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> 
     if (auditRes?.content?.toLowerCase().includes('approved')) {
         if (draftPatch?.tool_calls) {
             for (const call of draftPatch.tool_calls) {
-                if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
+                if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger, { autoApproveDiff: true });
             }
         }
         logger('✓ PATCH COMMITTED: Surgical edit verified by Council.', 'ai');
@@ -1268,7 +1285,7 @@ Format: FILE: [path] <<<<<<< SEARCH [exact lines] ======= [replacement] >>>>>>> 
             );
             if (heal?.tool_calls) {
                 for (const call of heal?.tool_calls) {
-                    if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger);
+                    if (call.function.name === 'apply_unified_diff') await executeToolCall(call, logger, { autoApproveDiff: true });
                 }
             }
         }
