@@ -46,6 +46,7 @@ export const LandingView: React.FC<{
     const reader = new FileReader();
     reader.onload = async (ev) => {
       const dataUrl = ev.target?.result as string;
+      const mime = dataUrl.split(';')[0].split(':')[1] || 'image/jpeg';
       const base64 = dataUrl.split(',')[1];
       setScreenshotPreview(dataUrl);
       setIsAnalyzingScreenshot(true);
@@ -58,7 +59,7 @@ export const LandingView: React.FC<{
             messages: [{
               role: 'user',
               content: [
-                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}` } },
+                { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } },
                 { type: 'text', text: 'Analyze this UI screenshot in exhaustive technical detail. Describe: exact layout structure, color palette (provide hex codes), typography (font sizes, weights), spacing, every component visible, interactions, and animations. Then output a complete React 19 + Tailwind CSS implementation specification that would recreate this UI pixel-accurately.' }
               ]
             }],

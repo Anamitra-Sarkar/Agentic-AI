@@ -108,7 +108,7 @@ async function startServer() {
     const limitData = rateLimitMap.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
 
     if (now >= limitData.resetAt) {
-      limitData.count = 0;
+      limitData.count = 1;
       limitData.resetAt = now + RATE_LIMIT_WINDOW;
     } else {
       limitData.count += 1;
@@ -221,8 +221,8 @@ async function startServer() {
           Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
           ...form.getHeaders(),
         },
-        body: form.getBuffer() as any,
-      });
+        body: form as any,
+      } as any);
 
       if (!upstream.ok) {
         const errorText = await upstream.text();

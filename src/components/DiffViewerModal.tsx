@@ -1,3 +1,4 @@
+import * as Diff from 'diff';
 import { X, FileCode2 } from 'lucide-react';
 import ReactDOM from 'react-dom';
 
@@ -16,20 +17,17 @@ interface DiffViewerModalProps {
 }
 
 function computeDiff(oldText: string, newText: string): DiffLine[] {
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
+  const changes = Diff.diffLines(oldText, newText);
   const result: DiffLine[] = [];
-  const maxLen = Math.max(oldLines.length, newLines.length);
-  for (let i = 0; i < maxLen; i++) {
-    if (i >= oldLines.length) {
-      result.push({ type: 'added', content: newLines[i], lineNumber: i + 1 });
-    } else if (i >= newLines.length) {
-      result.push({ type: 'removed', content: oldLines[i], lineNumber: i + 1 });
-    } else if (oldLines[i] !== newLines[i]) {
-      result.push({ type: 'removed', content: oldLines[i], lineNumber: i + 1 });
-      result.push({ type: 'added', content: newLines[i], lineNumber: i + 1 });
-    } else {
-      result.push({ type: 'unchanged', content: oldLines[i], lineNumber: i + 1 });
+  let lineNumber = 1;
+  for (const part of changes) {
+    const lines = part.value.split('\n').filter((_, i, arr) => i < arr.length - 1 || arr[i] !== '');
+    for (const line of lines) {
+      result.push({
+        type: part.added ? 'added' : part.removed ? 'removed' : 'unchanged',
+        content: line,
+        lineNumber: lineNumber++,
+      });
     }
   }
   return result;

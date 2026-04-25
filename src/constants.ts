@@ -4,8 +4,8 @@ export const TaskRouter = {
   rectification:       { provider: 'groq' as const, model: 'llama-3.3-70b-versatile' },
   compression:         { provider: 'groq' as const, model: 'llama-3.3-70b-versatile' },
   toolController:      { provider: 'groq' as const, model: 'llama-3.3-70b-versatile' },
-  validation:          { provider: 'groq' as const, model: 'openai/gpt-oss-120b' },
-  audit:               { provider: 'groq' as const, model: 'openai/gpt-oss-120b' },
+  validation:          { provider: 'openrouter' as const, model: 'openai/gpt-oss-120b' },
+  audit:               { provider: 'openrouter' as const, model: 'openai/gpt-oss-120b' },
   rapidPatch:          { provider: 'groq' as const, model: 'qwen/qwen3-32b' },
   draft:               { provider: 'groq' as const, model: 'meta-llama/llama-4-scout-17b-16e-instruct' },
 

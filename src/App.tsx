@@ -1190,7 +1190,7 @@ Return ONLY valid JSON in this exact shape:
     );
     const intent = intentRes?.content?.trim().toLowerCase().split(/\s/)[0] || 'frontend';
 
-    const taskForIntent: Record<string, any> = {
+    const taskForIntent: Record<string, typeof TaskRouter[keyof typeof TaskRouter]> = {
       'backend':      TaskRouter.backendCore,
       'frontend':     TaskRouter.frontendReact,
       'bugfix':       TaskRouter.bugAnalysis,
@@ -1199,7 +1199,7 @@ Return ONLY valid JSON in this exact shape:
       'styling':      TaskRouter.visualAnalysis,
     };
     const selectedTask = taskForIntent[intent] ?? TaskRouter.draft;
-    logger(`🧠 Intent: "${intent}" → Routing to ${selectedTask.model}`, 'system');
+    logger(`🧠 Intent: "${intent}" → Routing to ${selectedTask?.model || TaskRouter.draft.model}`, 'system');
 
     // INTENT PREDICTION: Pre-Flight Scan
     if (userMsg.toLowerCase().includes('backend') || userMsg.toLowerCase().includes('api')) {
